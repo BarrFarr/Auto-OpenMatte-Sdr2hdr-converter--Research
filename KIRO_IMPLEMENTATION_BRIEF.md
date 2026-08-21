@@ -42,32 +42,108 @@ Throughput target: **≤ 41.6 ms/frame end-to-end** (24 fps ⇒ ≤ 1x material 
 1. **Do not modify the frozen baseline** (`fit_shot`, `v1.predict`, `v4.apply_intensity_conditioned`, gain field, spatial field, renderer, NVDEC/CUDA/NVENC transport, source media) except where a task below explicitly authorizes it. Performance tasks 1, 3, 8 must be **bit-behaviour-preserving within a declared tolerance** — see each task.
 2. **Every task is a separate branch and a separate PR.** Do not bundle a performance fix with a quality change; they need independent A/B evidence.
 3. **Predeclare acceptance criteria before running the measurement.** Write them into the PR description first, then run. Do not tune the threshold to the result.
-4. **Numerical-regression guard for all performance work:** render the same 20-frame interval before and after, compare output P010 planes. Declare and justify a tolerance (a 1-code-value 10-bit difference is acceptable; a systematic shift is not). Record max abs diff and the fraction of differing pixels.
+4. **Numerical-regression guard for all performance work:** render the same 20-frame interval before and after, compare **the pre-encode P010 surfaces**, not the encoded files. NVENC output is not guaranteed bit-reproducible, so diffing MKVs confounds encoder variation with the change under test. Dump the P010 surface immediately before the NVENC handoff. Declare and justify a tolerance (a 1-code-value 10-bit difference is acceptable; a systematic shift is not). Record max abs diff and the differing-pixel fraction per plane.
+5. **Every diagnostic must ship its generator.** A measurement harness that is deleted after the run leaves a JSON that nobody can reproduce. Commit the harness next to the report, following the precedent already set by `research/physical_validation/*/run_*.py`.
 5. **Never commit source-derived video frames or full-resolution PNGs** to git. JSON reports and small diagnostic plots only.
 6. **Working tree must be clean before starting.** See task 0.
 
 ---
 
-## Task 0 — Repository hygiene (do this first, blocks everything else)
+## Task 0 — Repository hygiene (AMENDED — do this first, blocks everything else)
 
-**Why:** Three diagnostic artifacts are local-only, and two production files carry uncommitted local modifications. Any measurement taken on uncommitted code is not reproducible and cannot be attached to a commit SHA, which breaks the project's own protocol discipline.
+> **Correction to the original acceptance criterion.** The first version of this brief required `git status --porcelain` to be empty. That was wrong: this repository carries a large pre-existing untracked pile, and an empty porcelain was never the actual goal. The goal is that **there is no ambiguity about the code that produced a measurement.**
+
+**Amended acceptance criterion:**
+- **No *tracked* file is modified without a commit** — `git status --porcelain` contains no `^ M` / `^M` / `^MM` lines.
+- The diagnostics are pinned to a **pushed** SHA, not a local-only one.
+- **No untracked file is imported by any measurement path.** Untracked clutter is harmless only as long as nothing in it participates in producing a result.
+
+**Status as of `a9f877e` (already done):**
+- `fast_chroma_field_intensity.py`, `fastcore.py` — committed in `7d50e83` with a behaviour-preserving rationale (defaults reproduce prior output).
+- `fit_scaling_100_250_500.json`, `fit_scaling_500f_profile.json`, `hcapm_full_overlap_zonal.json` — committed in `a9f877e` under `benchmarks/`.
+
+**Remaining steps:**
+
+1. **Push.** Remote `feat/full-pipeline-implementation` is still at `d0ef113`; `7d50e83` and `a9f877e` exist only locally. A local SHA cannot serve as a protocol pin — if the working copy is lost or the work moves machines, the pin and the reproducibility disappear with it.
+   ```
+   git push origin feat/full-pipeline-implementation
+   ```
+
+2. **Close the `.gitignore` gap.** The ~304 untracked files are a symptom of missing ignore rules, not a decision that needs making. The current `.gitignore` covers Python, venv, IDE and five anchored artifact paths, but nothing for decode caches, raw arrays, video or native build output. First survey what is actually there:
+   ```powershell
+   git status --porcelain | ForEach-Object { $_ -replace '^\?\?\s+','' } |
+     ForEach-Object { ($_ -split '/')[0..1] -join '/' } |
+     Group-Object | Sort-Object Count -Descending | Select-Object Count,Name -First 25
+   ```
+   Then append:
+   ```gitignore
+   # Decode caches and raw arrays (float32 memmaps are multi-GB)
+   tools/openmatte_hdr/cache/
+   **/cache/
+   *.dat
+   *.npy
+   *.bin
+
+   # Render outputs
+   tools/openmatte_hdr/out/
+   *.mkv
+   *.mp4
+   *.mov
+   *.y4m
+
+   # Native build artifacts
+   *.dll
+   *.lib
+   *.exp
+   *.pdb
+   *.obj
+   *.cubin
+   *.ptx
+
+   # ffmpeg build tree (keep dev/ffmpeg-build/validation/ evidence tracked)
+   dev/ffmpeg-build/ffmpeg/
+   dev/ffmpeg-build/build/
+   dev/ffmpeg-build/install/
+   dev/ffmpeg-build/nv-codec-headers/
+   ```
+   Three constraints on the above:
+   - **Do not** use `dev/ffmpeg-build/**` with a negation such as `!dev/ffmpeg-build/validation/**`. Git cannot re-include a file whose parent directory is excluded, so that pattern would silently drop the P230/P231/P232/P233 validation evidence. Enumerate the build subdirectories instead, as written.
+   - `*.mkv` is safe despite tracked MKVs in `P2.22_outputs/` and `P2.23_outputs/` — `.gitignore` does not affect already-tracked files.
+   - `*.dll` will catch `dev/v05-native/v5_gpu_bridge.dll`, which is correct (the handoff states the native bridge is not committed). **But then the bridge must be pinned another way:** commit its build script/toolchain, or record its version and SHA-256 inside every diagnostic JSON that depends on it. Otherwise all GPU measurements are pinned to a binary nobody can reconstruct.
+   
+   After this, re-run the survey. The remainder should be small enough to inspect by hand; anything that is genuine evidence (`.json`, `.md`, `.csv`) gets committed, everything else is now ignored. **No deletions are required.**
+
+3. **Restore the deleted harnesses.** Both temporary harnesses for the fit-scaling and full-overlap-zonal diagnostics were removed after the runs. That leaves two committed JSON reports with no reproducible generator, which contradicts ground rule 5 and the precedent set elsewhere in this repo (`run_analysis.py`, `run_chroma_field_extension.py`, `run_sampling_audit.py`, …). Reconstruct both harnesses and commit them next to their reports. If reconstruction is not exact, say so in the commit message and record what is uncertain.
+
+4. **Verify no untracked file participates in a measurement.** For each restored harness, confirm every import resolves to a tracked file. If any resolves into the untracked pile, that file is not clutter — commit it.
+
+**Model:** Luna / Sonnet-class, low reasoning effort for steps 1–2 and 4. Step 3 (harness reconstruction) is Terra / Sonnet-class, medium effort — it must faithfully reproduce a measurement, not merely run.
+
+---
+
+## Task 0b — Golden reference render (NEW — blocks tasks 1, 3 and 8)
+
+**Why this is a prerequisite, not bureaucracy.** Two independent gaps close with one action:
+
+1. The claim that `7d50e83` is behaviour-preserving is currently **asserted, not measured**. "Defaults reproduce prior output exactly" is exactly the kind of claim that is cheap to prove once and expensive to discover as false later.
+2. Ground rule 4 requires every performance task to compare output before and after — which needs a **pinned reference output that does not yet exist**. Without it, "≤ 3 ms/frame" in task 1 is unverifiable, and the fastest possible kernel is one that writes zeros.
 
 **Steps:**
-1. Inspect the uncommitted modifications:
-   ```
-   git diff -- tools/openmatte_hdr/fast_chroma_field_intensity.py tools/openmatte_hdr/fastcore.py
-   ```
-2. Decide per file: commit (if intentional) or revert (if scratch). Do not leave them dirty. If committing, the message must state what changed and why.
-3. Commit the three diagnostic artifacts — they are evidence:
-   - `fit_scaling_100_250_500.json`
-   - `fit_scaling_500f_profile.json`
-   - `hcapm_full_overlap_zonal.json`
-   Place them next to the existing benchmark evidence under `benchmarks/v05_gpu_native_segmented_test300/` unless a better-matching directory already exists.
-4. Confirm `git status --porcelain` is empty.
 
-**Acceptance:** clean tree; all three artifacts tracked; the two production files either committed with a rationale or reverted.
+1. Use **the same 20-frame interval as the Nsight capture** (`benchmarks/nsight_render20/`), so the profile and the numerical guard describe identical material.
+2. Render that interval at **`d0ef113`** (= `7d50e83^`) and at **`a9f877e`**.
+3. Dump the **pre-encode P010 surface** for each frame in both runs — before the NVENC handoff, not the encoded MKV (see ground rule 4).
+4. Compare: per-plane (Y, UV) max abs diff and differing-pixel fraction, plus per-frame SHA-256 of each surface.
+5. If the two runs are identical, the behaviour-preserving claim for `7d50e83` is proven. If they are not, stop and investigate before doing anything else — a silent change in the colour path invalidates every gate downstream.
+6. Freeze the `a9f877e` output as the **golden reference** for tasks 1, 3 and 8.
 
-**Model:** Sonnet-class, low reasoning effort. Mechanical.
+**What to commit:** the 20 per-frame SHA-256 values, the diff statistics, the exact render command, the input frame hashes, and the `v5_gpu_bridge.dll` version/hash. **Not** the raw surfaces — 20 frames of 4K P010 is ≈ 498 MB and is now covered by the `.gitignore` rules from task 0. Keep the raw dumps locally for actual diffing.
+
+Suggested location: `benchmarks/golden_reference_render20/`.
+
+**Acceptance:** a committed JSON containing per-frame hashes for `a9f877e`, the `d0ef113`-vs-`a9f877e` comparison result, and a stated verdict on the behaviour-preserving claim. Raw surfaces present locally and reachable by a documented path.
+
+**Model:** Terra / Sonnet-class, medium reasoning effort. Mechanically simple but the correctness of every later performance claim depends on getting the dump point and the hashing right.
 
 ---
 
@@ -281,7 +357,7 @@ That measurement aggregates over full rows, which **averages out any horizontal 
 ## Ordering and dependencies
 
 ```
-Task 0  (hygiene) ──> everything
+Task 0  (hygiene) ──> Task 0b (golden reference) ──> everything
 
 Performance track (independent of colour):
   Task 1  (yuv_to_working_rgb)  ─┐
@@ -323,16 +399,22 @@ Task 6 is still worth doing: at 16–32 parameters it is cheap and it is now pro
 
 ## Model and reasoning-level summary
 
-| Task | Model class | Reasoning effort | Rationale |
-|---|---|---|---|
-| 0 — hygiene | Sonnet | low | mechanical git work |
-| 1 — `yuv_to_working_rgb` | **Opus** | **high** | profiler/SASS reading, precision-promotion rules, correctness of colour path |
-| 2 — fit VRAM | **Opus** | **high** | lifetime/ownership across Python↔native with a surface ring |
-| 3 — Gaussian | Sonnet | medium | localised, but border handling is subtle |
-| 4 — stratified sampling | **Opus** | **high** | statistical design with direct quality consequences |
-| 5 — x-dependence test | Sonnet | medium | mirrors an existing harness |
-| 6 — L2 1-D field | **Opus** | **high** | core quality change; must not repeat prior gate errors |
-| 7 — linearity gate | Sonnet | low | small, fully specified |
-| 8 — fuse + bake LUT | **Opus** | **high** | hardest item; hand-written CUDA plus lattice solve |
+| Task | Claude | GPT-5.6 | Effort | Rationale |
+|---|---|---|---|---|
+| 0 — hygiene (steps 1–2, 4) | Sonnet | **Luna** | low | mechanical git work |
+| 0 — hygiene (step 3, harnesses) | Sonnet | **Terra** | medium | must reproduce a measurement, not just run |
+| 0b — golden reference | Sonnet | **Terra** | medium | simple, but every later perf claim rests on it |
+| 1 — `yuv_to_working_rgb` | **Opus** | **Sol** | **high** | profiler/SASS reading, precision-promotion rules, correctness of colour path |
+| 2 — fit VRAM | **Opus** | **Sol** | **high** | lifetime/ownership across Python↔native with a surface ring |
+| 3 — Gaussian | Sonnet | **Terra** | medium | localised, but border handling is subtle |
+| 4 — stratified sampling | **Opus** | **Sol** | **high** | statistical design with direct quality consequences |
+| 5 — x-dependence test | Sonnet | **Terra** | medium | mirrors an existing harness |
+| 6 — L2 1-D field | **Opus** | **Sol** | **high** | core quality change; must not repeat prior gate errors |
+| 7 — linearity gate | Sonnet | **Luna** | low | small, fully specified |
+| 8 — fuse + bake LUT | **Opus** | **Sol** | **high** | hardest item; hand-written CUDA plus lattice solve |
+
+GPT-5.6 (released 9 July 2026) ships as three tiers — Luna, Terra, Sol, weakest to strongest. Sol is positioned for frontier reasoning, coding and long-horizon agentic work; Terra as the balanced everyday model; Luna as the fastest and cheapest. After the 30 July 2026 price cut, Luna is $0.20/$1.20 and Terra $2/$12 per million input/output tokens. A practical use for Luna beyond tasks 0 and 7: pre-summarising large profiler dumps and metric JSONs (`nsight_render20.json`, `hcapm_zonal_ab.json` ≈ 98 KB, `seam_hppm_ab.json` ≈ 100 KB) into compact tables before they enter a Sol context.
+
+**Economics that actually matter here.** On tasks 1 and 8 a wrong `f` suffix, a mis-indexed LUT or a global `--use_fast_math` shifts every pixel of the film without failing a single test. The error surfaces during an HDR visual review hours later, or not at all — and it invalidates the numerical gates the whole protocol rests on. The price difference between tiers on one task is negligible against one such cycle.
 
 **General guidance:** anything that touches the numerical colour path, the CUDA kernels, or the statistical design of a fit should run on the strongest available model with extended thinking enabled. Tasks 0, 3, 5 and 7 are safe on a mid-tier model provided the acceptance criteria in this brief are enforced verbatim. In all cases the agent must have a working local build and the RTX 3080 available — none of the acceptance thresholds here can be verified without running on the target GPU.
