@@ -14,6 +14,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -169,6 +170,379 @@ class InspectWorker(QThread):
             self.finished.emit(None)
 
 
+# Preview quality tiers. DRAFT is a small, fast frame used while the user
+# scrubs or plays; FULL is the higher-resolution frame delivered once the user
+# settles. Only FULL frames are cached and only FULL frames may be used for
+# any visual judgement.
+PREVIEW_DRAFT = "draft"
+PREVIEW_FULL = "full"
+
+_PREVIEW_CAPABILITIES: Optional[dict] = None
+
+
+def _preview_capabilities() -> dict:
+    """Probe ffmpeg once for CUDA decode and GPU scaling support.
+
+    The result is cached for the process lifetime. This only inspects ffmpeg's
+    advertised capabilities; it does not touch the production CUDA pipeline.
+    """
+    global _PREVIEW_CAPABILITIES
+    if _PREVIEW_CAPABILITIES is not None:
+        return _PREVIEW_CAPABILITIES
+
+    caps = {"ffmpeg": _find_ffmpeg(), "cuda": False, "scale_cuda": False}
+    ffmpeg_path = caps["ffmpeg"]
+    if ffmpeg_path:
+        try:
+            hwaccels = subprocess.run(
+                [ffmpeg_path, "-hide_banner", "-hwaccels"],
+                capture_output=True, timeout=20, check=False,
+                **_preview_subprocess_flags(),
+            )
+            caps["cuda"] = b"cuda" in hwaccels.stdout
+            filters = subprocess.run(
+                [ffmpeg_path, "-hide_banner", "-filters"],
+                capture_output=True, timeout=30, check=False,
+                **_preview_subprocess_flags(),
+            )
+            caps["scale_cuda"] = b"scale_cuda" in filters.stdout
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    _PREVIEW_CAPABILITIES = caps
+    return caps
+
+
+def _preview_subprocess_flags() -> dict:
+    """Keep preview decoders from stealing foreground priority on Windows."""
+    if sys.platform == "win32":
+        return {
+            "creationflags": (
+                subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+            )
+        }
+    return {}
+
+
+class PreviewWorker(QThread):
+    """Decode preview frames away from the Qt GUI thread.
+
+    Two request lanes are served: a DRAFT lane for interaction and a FULL lane
+    for the settled frame. The DRAFT lane always wins, and a newly queued
+    DRAFT request cancels any FULL decode already in flight, so interaction
+    never waits behind an expensive decode.
+
+    Sequential playback reuses a persistent ffmpeg raw-video stream. Jumps
+    restart the stream with ffmpeg INPUT seek (``-ss`` before ``-i``), which
+    seeks to the nearest keyframe instead of decoding from frame zero. GPU
+    decode and GPU downscaling are used when ffmpeg advertises them.
+
+    This class is limited to preview frames of the SOURCES. It never calls
+    production fitting, rendering, or the production CUDA/NVDEC/NVENC path.
+    """
+
+    frame_ready = Signal(object)  # {generation, quality, frame, om_frame, images}
+    error = Signal(str)
+
+    _MAX_DECODERS = 4
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._condition = threading.Condition()
+        self._pending = {PREVIEW_DRAFT: None, PREVIEW_FULL: None}
+        self._serials = {PREVIEW_DRAFT: 0, PREVIEW_FULL: 0}
+        self._running = True
+        self._decoders = {}
+        self._use_counter = 0
+
+    @staticmethod
+    def _scaled_size(source_width: int, source_height: int, target_width: int):
+        """Return a deterministic even-sized RGB preview output."""
+        target_width = max(2, int(target_width) // 2 * 2)
+        if source_width <= 0 or source_height <= 0:
+            return target_width, max(2, (target_width * 9 // 16) // 2 * 2)
+        height = max(2, int(target_width * source_height / source_width))
+        if height % 2:
+            height -= 1
+        return target_width, max(2, height)
+
+    def request_frames(self, request: dict):
+        """Queue the newest request for its quality lane."""
+        quality = request.get("quality", PREVIEW_DRAFT)
+        with self._condition:
+            self._serials[quality] += 1
+            request = dict(request)
+            request["quality"] = quality
+            request["serial"] = self._serials[quality]
+            self._pending[quality] = request
+            self._condition.notify()
+
+    def cancel_quality(self, quality: str):
+        """Drop any queued and in-flight request for one lane."""
+        with self._condition:
+            self._serials[quality] += 1
+            self._pending[quality] = None
+
+    def stop(self):
+        """Stop the worker and terminate any active ffmpeg streams."""
+        with self._condition:
+            self._running = False
+            self._pending = {PREVIEW_DRAFT: None, PREVIEW_FULL: None}
+            self._condition.notify()
+
+    def _is_obsolete(self, request: dict) -> bool:
+        """A request is obsolete if superseded, or if DRAFT work is waiting."""
+        with self._condition:
+            if not self._running:
+                return True
+            quality = request["quality"]
+            if request["serial"] != self._serials[quality]:
+                return True
+            # Interaction preempts the expensive lane.
+            if quality == PREVIEW_FULL and self._pending[PREVIEW_DRAFT] is not None:
+                return True
+            return False
+
+    def _decoder_for(self, source: dict, request: dict):
+        width, height = self._scaled_size(
+            int(source.get("width", 0) or 0),
+            int(source.get("height", 0) or 0),
+            int(source.get("preview_width", 960) or 960),
+        )
+        # Keyed by output size, so the DRAFT and FULL streams coexist instead of
+        # evicting each other during playback.
+        key = (source["path"], width, height)
+        decoder = self._decoders.get(key)
+        if decoder is None:
+            self._evict_decoders(keep=self._MAX_DECODERS - 1)
+            decoder = _PreviewStreamDecoder(source["path"], width, height)
+            self._decoders[key] = decoder
+        decoder.fps = max(1.0, float(source.get("fps", 24.0) or 24.0))
+        decoder.threads = 2 if request["quality"] == PREVIEW_DRAFT else 4
+        self._use_counter += 1
+        decoder.last_used = self._use_counter
+        return decoder
+
+    def _evict_decoders(self, keep: int):
+        """Close least-recently-used decoders so ffmpeg processes stay bounded."""
+        while len(self._decoders) > max(0, keep):
+            oldest = min(self._decoders, key=lambda k: self._decoders[k].last_used)
+            self._decoders.pop(oldest).close()
+
+    def _drop_inactive_decoders(self, request: dict):
+        """Close decoders for sources that are no longer loaded."""
+        active_paths = {
+            source["path"]
+            for source in (request.get("hdr"), request.get("om"))
+            if source and source.get("path")
+        }
+        for key in list(self._decoders):
+            if key[0] not in active_paths:
+                self._decoders.pop(key).close()
+
+    def _decode_source(self, source: Optional[dict], frame: int, request: dict):
+        if not source or not source.get("path"):
+            return None
+        if self._is_obsolete(request):
+            return None
+        decoder = self._decoder_for(source, request)
+        return decoder.read_to(max(0, int(frame)), lambda: self._is_obsolete(request))
+
+    def _decode_request(self, request: dict):
+        self._drop_inactive_decoders(request)
+        hdr_image = self._decode_source(request.get("hdr"), request["frame"], request)
+        if self._is_obsolete(request):
+            return
+        om_image = self._decode_source(request.get("om"), request["om_frame"], request)
+        if self._is_obsolete(request):
+            return
+        self.frame_ready.emit({
+            "generation": request["generation"],
+            "quality": request["quality"],
+            "frame": request["frame"],
+            "om_frame": request["om_frame"],
+            "hdr_image": hdr_image,
+            "om_image": om_image,
+        })
+
+    def _next_request(self) -> Optional[dict]:
+        """Take the next request, DRAFT lane first."""
+        with self._condition:
+            while self._running:
+                for quality in (PREVIEW_DRAFT, PREVIEW_FULL):
+                    request = self._pending[quality]
+                    if request is not None:
+                        self._pending[quality] = None
+                        return request
+                self._condition.wait()
+        return None
+
+    def run(self):
+        while True:
+            request = self._next_request()
+            if request is None:
+                break
+            try:
+                self._decode_request(request)
+            except Exception as exc:
+                if not self._is_obsolete(request):
+                    self.error.emit(f"Preview decode failed: {exc}")
+
+        self._evict_decoders(keep=0)
+
+
+class _PreviewStreamDecoder:
+    """Small ffmpeg stream wrapper used only by PreviewWorker."""
+
+    # Reading forward is cheaper than restarting ffmpeg for nearby targets.
+    _FORWARD_LIMIT = 48
+
+    def __init__(self, path: str, width: int, height: int):
+        self.path = path
+        self.width = width
+        self.height = height
+        self.fps = 24.0
+        self.threads = 2
+        self.last_used = 0
+        self.allow_gpu = True
+        self._gpu_active = False
+        self._process = None
+        self._cursor = -1
+        self._last_image = None
+
+    def close(self):
+        process = self._process
+        self._process = None
+        self._cursor = -1
+        self._last_image = None
+        if process is not None:
+            try:
+                if process.stdout:
+                    process.stdout.close()
+            except OSError:
+                pass
+            try:
+                process.kill()
+                process.wait(timeout=1)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+    def _start(self, start_frame: int):
+        self.close()
+        caps = _preview_capabilities()
+        ffmpeg_path = caps.get("ffmpeg")
+        if not ffmpeg_path or not Path(self.path).is_file():
+            return False
+
+        # INPUT seek (-ss before -i) jumps to the nearest keyframe and decodes
+        # forward from there. The previous OUTPUT seek decoded from frame zero,
+        # which saturated the CPU on long 4K sources. The 9-decimal timestamp
+        # mirrors the production tool's decoder_command for frame alignment.
+        seek_seconds = max(0.0, start_frame / max(self.fps, 1.0))
+        use_gpu = self.allow_gpu and caps["cuda"] and caps["scale_cuda"]
+
+        cmd = [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-nostdin"]
+        if use_gpu:
+            cmd += ["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"]
+        cmd += [
+            "-ss", f"{seek_seconds:.9f}",
+            "-i", self.path,
+            "-map", "0:v:0",
+            "-an", "-sn", "-dn",
+        ]
+        if use_gpu:
+            # Downscale on the GPU so only the small frame crosses PCIe.
+            cmd += [
+                "-vf",
+                f"scale_cuda={self.width}:{self.height}:format=nv12"
+                ",hwdownload,format=nv12",
+            ]
+        else:
+            cmd += [
+                "-threads", str(max(1, int(self.threads))),
+                "-vf", f"scale={self.width}:{self.height}:flags=fast_bilinear",
+            ]
+        cmd += ["-pix_fmt", "rgb24", "-vsync", "0", "-f", "rawvideo", "pipe:1"]
+
+        try:
+            self._process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                bufsize=0,
+                **_preview_subprocess_flags(),
+            )
+            self._gpu_active = use_gpu
+            self._cursor = start_frame - 1
+            self._last_image = None
+            return True
+        except (FileNotFoundError, OSError):
+            self.close()
+            return False
+
+    def _read_one(self):
+        if self._process is None or self._process.stdout is None:
+            return None
+        size = self.width * self.height * 3
+        try:
+            raw = bytearray()
+            while len(raw) < size:
+                chunk = self._process.stdout.read(size - len(raw))
+                if not chunk:
+                    return None
+                raw.extend(chunk)
+        except (OSError, ValueError):
+            return None
+        return QImage(
+            bytes(raw),
+            self.width,
+            self.height,
+            self.width * 3,
+            QImage.Format.Format_RGB888,
+        ).copy()
+
+    def _needs_restart(self, target: int) -> bool:
+        return (
+            self._process is None
+            or target < self._cursor
+            or target - self._cursor > self._FORWARD_LIMIT
+        )
+
+    def read_to(self, target: int, should_abort) -> Optional[QImage]:
+        """Return the frame at ``target``, reusing the stream when sequential."""
+        if target == self._cursor and self._last_image is not None:
+            return self._last_image
+
+        if self._needs_restart(target) and not self._start(target):
+            return None
+
+        image = self._read_forward(target, should_abort)
+        if image is not None or should_abort():
+            return image
+
+        # A GPU chain can fail at runtime even when ffmpeg advertises it
+        # (driver, session limits, unsupported codec). Fall back to CPU once
+        # and remember the decision for this decoder.
+        if self._gpu_active:
+            self.allow_gpu = False
+            if self._start(target):
+                return self._read_forward(target, should_abort)
+        return None
+
+    def _read_forward(self, target: int, should_abort) -> Optional[QImage]:
+        while self._cursor < target:
+            if should_abort():
+                return None
+            image = self._read_one()
+            if image is None:
+                self.close()
+                return None
+            self._cursor += 1
+            self._last_image = image
+        return self._last_image
+
+
 class SyncWorker(QThread):
     """Worker thread for auto-sync (calls find_global_offset)."""
 
@@ -274,6 +648,8 @@ class PipelineAdapter(QObject):
 
     inspect_completed = Signal(object)  # SourceFileInfo
     sync_completed = Signal(object)  # dict with sync results
+    preview_frame_ready = Signal(object)  # decoded preview frame pair
+    preview_error = Signal(str)
     render_progress = Signal(object)  # RenderStatus
     render_completed = Signal(bool)
     inspect_error = Signal(str)
@@ -285,6 +661,10 @@ class PipelineAdapter(QObject):
         self._inspect_worker: Optional[InspectWorker] = None
         self._sync_worker: Optional[SyncWorker] = None
         self._render_worker: Optional[RenderWorker] = None
+        self._preview_worker = PreviewWorker(self)
+        self._preview_worker.frame_ready.connect(self.preview_frame_ready.emit)
+        self._preview_worker.error.connect(self.preview_error.emit)
+        self._preview_worker.start()
 
     def get_backend_status(self) -> dict:
         """Query availability and capabilities of the portable backend.
@@ -373,6 +753,54 @@ class PipelineAdapter(QObject):
             "bridge_sha256": "",
             "bridge_exists": False,
         }
+
+    def request_preview_frames(
+        self,
+        hdr_source: Optional[dict],
+        om_source: Optional[dict],
+        frame: int,
+        om_frame: int,
+        generation: int,
+        preview_width: int = 960,
+        quality: str = PREVIEW_DRAFT,
+    ):
+        """Queue the newest preview frame pair for one quality lane.
+
+        This is intentionally separate from ``extract_frame`` and from all
+        production backend calls. The worker owns ffmpeg streams and drops
+        stale requests while the user scrubs.
+        """
+        for source in (hdr_source, om_source):
+            if source is not None:
+                source["preview_width"] = preview_width
+        self._preview_worker.request_frames({
+            "hdr": hdr_source,
+            "om": om_source,
+            "frame": max(0, int(frame)),
+            "om_frame": max(0, int(om_frame)),
+            "generation": generation,
+            "quality": quality,
+        })
+
+    def cancel_full_preview(self):
+        """Abandon a pending full-quality preview decode."""
+        self._preview_worker.cancel_quality(PREVIEW_FULL)
+
+    def preview_backend_info(self) -> dict:
+        """Report which preview decode path is in use, for display only."""
+        caps = _preview_capabilities()
+        return {
+            "ffmpeg": bool(caps.get("ffmpeg")),
+            "cuda": bool(caps.get("cuda")),
+            "scale_cuda": bool(caps.get("scale_cuda")),
+            "gpu_preview": bool(caps.get("cuda") and caps.get("scale_cuda")),
+        }
+
+    def stop_preview(self):
+        """Stop the GUI-only preview worker during application shutdown."""
+        if self._preview_worker and self._preview_worker.isRunning():
+            self._preview_worker.stop()
+            self._preview_worker.wait(2000)
 
     def inspect_file(self, path: str) -> Optional[SourceFileInfo]:
         """Inspect a video file using backend ffprobe integration.

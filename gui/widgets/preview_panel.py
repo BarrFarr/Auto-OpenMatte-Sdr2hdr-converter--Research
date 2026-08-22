@@ -23,9 +23,10 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QLineEdit,
 )
-from PySide6.QtCore import Qt, Slot, Signal, QSize
+from PySide6.QtCore import Qt, Slot, Signal, QSize, QTimer
 from PySide6.QtGui import QPixmap, QPainter, QColor, QImage
 
+from gui.controllers.pipeline_adapter import PREVIEW_DRAFT, PREVIEW_FULL
 from gui.models.state import AppState
 
 
@@ -53,7 +54,11 @@ class FrameCache:
     def get(self, path: str, frame: int) -> Optional[QImage]:
         """Retrieve a cached frame or None."""
         key = (path, frame)
-        return self._cache.get(key)
+        image = self._cache.get(key)
+        if image is not None and key in self._order:
+            self._order.remove(key)
+            self._order.append(key)
+        return image
 
     def put(self, path: str, frame: int, image: QImage):
         """Store a frame image, evicting oldest if over max_size."""
@@ -355,16 +360,26 @@ class PreviewPanel(QWidget):
 
         # Frame cache: max 6 entries (3 per source: current +/- 1)
         self._frame_cache = FrameCache(max_size=6)
+        self._preview_generation = 0
+        self._is_playing = False
+        self._scrubbing = False
+        self._displayed_frame = -1
+        self._displayed_quality = None
+        self._playback_timer = QTimer(self)
+        self._playback_timer.setInterval(33)
+        # Escalation to full quality happens only after the user settles.
+        self._escalate_timer = QTimer(self)
+        self._escalate_timer.setSingleShot(True)
+        self._escalate_timer.setInterval(220)
 
         self._setup_ui()
         self._connect_signals()
 
     def set_pipeline_adapter(self, adapter):
-        """Set the pipeline adapter for frame extraction.
-
-        Must be called after construction to provide access to extract_frame().
-        """
+        """Set the adapter used by the background preview decoder."""
         self._pipeline_adapter = adapter
+        adapter.preview_frame_ready.connect(self._on_preview_frame_ready)
+        adapter.preview_error.connect(self._on_preview_error)
 
     def _setup_ui(self):
         """Create the panel layout."""
@@ -444,8 +459,11 @@ class PreviewPanel(QWidget):
         nav_group = QGroupBox("Frame Navigation", self)
         nav_layout = QVBoxLayout(nav_group)
 
-        # Navigation buttons row 1: frame steps
+        # Navigation buttons row 1: playback and frame steps
         nav_row1 = QHBoxLayout()
+        self.play_pause_btn = QPushButton("Play", self)
+        self.play_pause_btn.setMinimumWidth(72)
+        self.preview_status_label = QLabel("Idle", self)
         self.prev_1sec_btn = QPushButton("-1s", self)
         self.prev_10_btn = QPushButton("-10", self)
         self.prev_1_btn = QPushButton("-1", self)
@@ -453,6 +471,8 @@ class PreviewPanel(QWidget):
         self.next_10_btn = QPushButton("+10", self)
         self.next_1sec_btn = QPushButton("+1s", self)
 
+        nav_row1.addWidget(self.play_pause_btn)
+        nav_row1.addWidget(self.preview_status_label)
         nav_row1.addWidget(self.prev_1sec_btn)
         nav_row1.addWidget(self.prev_10_btn)
         nav_row1.addWidget(self.prev_1_btn)
@@ -482,7 +502,7 @@ class PreviewPanel(QWidget):
 
         # Frame slider
         self.frame_slider = QSlider(Qt.Orientation.Horizontal, self)
-        self.frame_slider.setRange(0, 1000)
+        self.frame_slider.setRange(0, 0)
         self.frame_slider.setValue(0)
         nav_layout.addWidget(self.frame_slider)
 
@@ -506,6 +526,11 @@ class PreviewPanel(QWidget):
         self.zoom_out_btn.clicked.connect(self._zoom_out)
 
         # Navigation
+        self.play_pause_btn.clicked.connect(self._toggle_playback)
+        self._playback_timer.timeout.connect(self._on_playback_tick)
+        self._escalate_timer.timeout.connect(self._request_full_quality)
+        self.frame_slider.sliderPressed.connect(self._on_scrub_started)
+        self.frame_slider.sliderReleased.connect(self._on_scrub_finished)
         self.prev_1_btn.clicked.connect(lambda: self._navigate(-1))
         self.next_1_btn.clicked.connect(lambda: self._navigate(1))
         self.prev_10_btn.clicked.connect(lambda: self._navigate(-10))
@@ -519,6 +544,7 @@ class PreviewPanel(QWidget):
         # State observation
         self.app_state.preview_frame_changed.connect(self._refresh_display)
         self.app_state.sources_changed.connect(self._on_sources_changed)
+        self.app_state.sync_changed.connect(self._on_sync_changed)
 
     @Slot(int)
     def _on_mode_changed(self, index: int):
@@ -620,47 +646,258 @@ class PreviewPanel(QWidget):
 
     @Slot(int)
     def _on_slider_changed(self, value: int):
-        """Handle frame slider change."""
-        # Map slider (0-1000) to actual frame range
+        """Handle a real frame-number slider without blocking the GUI."""
         total = self._get_total_frames()
         if total > 0:
-            frame = int(value * total / 1000)
-            self.app_state.set_current_frame(frame)
+            self.app_state.set_current_frame(
+                max(0, min(total - 1, int(value)))
+            )
 
     @Slot()
     def _on_sources_changed(self):
-        """Update display when sources change."""
-        total = self._get_total_frames()
-        self.frame_spinbox.setRange(0, max(0, total - 1))
-        # Clear cache when sources change
+        """Reset preview navigation when the source pair changes."""
+        self._stop_playback()
+        self._escalate_timer.stop()
+        self._preview_generation += 1
         self._frame_cache.clear()
+        self._displayed_frame = -1
+        self._displayed_quality = None
+        total = self._get_total_frames()
+        maximum = max(0, total - 1)
+        self.frame_spinbox.setRange(0, maximum)
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setRange(0, maximum)
+        self.frame_slider.setValue(min(self.app_state.current_frame, maximum))
+        self.frame_slider.blockSignals(False)
         self._refresh_display()
 
     @Slot()
-    def _refresh_display(self):
-        """Refresh frame display by extracting real frames."""
-        frame = self.app_state.current_frame
+    def _on_sync_changed(self):
+        """Request the same HDR frame with the newly proposed OM offset."""
+        self._preview_generation += 1
+        self._refresh_display()
 
-        # Calculate OM frame with sync offset
+    @Slot()
+    def _toggle_playback(self):
+        """Start or stop timer-driven playback."""
+        if self._is_playing:
+            self._stop_playback()
+            return
+        if self._get_total_frames() <= 0 or self._pipeline_adapter is None:
+            self.preview_status_label.setText("Load HDR source")
+            return
+        fps = self._get_fps()
+        self._playback_timer.setInterval(max(10, int(round(1000.0 / fps))))
+        self._is_playing = True
+        self.play_pause_btn.setText("Pause")
+        self.preview_status_label.setText("Playing")
+        self._playback_timer.start()
+
+    def _stop_playback(self):
+        """Stop playback and escalate the paused frame to full quality."""
+        was_playing = self._is_playing
+        self._is_playing = False
+        self._playback_timer.stop()
+        if hasattr(self, "play_pause_btn"):
+            self.play_pause_btn.setText("Play")
+        if was_playing and not self._scrubbing and self._pipeline_adapter is not None:
+            self._escalate_timer.start()
+
+    @Slot()
+    def _on_playback_tick(self):
+        """Advance one frame; decoding remains in PreviewWorker."""
+        total = self._get_total_frames()
+        next_frame = self.app_state.current_frame + 1
+        if total <= 0 or next_frame >= total:
+            self._stop_playback()
+            return
+        self.app_state.set_current_frame(next_frame)
+
+    @Slot(object)
+    def _on_preview_frame_ready(self, result):
+        """Apply only the newest completed background decode."""
+        if result.get("generation") != self._preview_generation:
+            return
+        frame = int(result.get("frame", -1))
+        if frame != self.app_state.current_frame:
+            return
+
+        quality = result.get("quality", PREVIEW_DRAFT)
+        # Never replace an already displayed full-quality frame with a draft.
+        if (
+            quality == PREVIEW_DRAFT
+            and frame == self._displayed_frame
+            and self._displayed_quality == PREVIEW_FULL
+        ):
+            return
+
+        hdr_image = result.get("hdr_image")
+        om_image = result.get("om_image")
+        om_frame = int(result.get("om_frame", frame))
+        # Only full-quality frames are cached, so the cache can never satisfy a
+        # request with a lower-resolution image.
+        if quality == PREVIEW_FULL:
+            if self.app_state.hdr_source and hdr_image is not None:
+                self._frame_cache.put(
+                    self.app_state.hdr_source.path, frame, hdr_image
+                )
+            if self.app_state.om_source and om_image is not None:
+                self._frame_cache.put(
+                    self.app_state.om_source.path, om_frame, om_image
+                )
+
+        self.display_widget.set_hdr_frame(
+            QPixmap.fromImage(hdr_image) if hdr_image is not None else None
+        )
+        self.display_widget.set_om_frame(
+            QPixmap.fromImage(om_image) if om_image is not None else None
+        )
+        self._displayed_frame = frame
+        self._displayed_quality = quality
+        self._update_quality_badge(quality)
+
+    @Slot(str)
+    def _on_preview_error(self, message: str):
+        """Show worker errors without stopping the rest of the GUI."""
+        self.preview_status_label.setText("Preview unavailable")
+        self.app_state.status_message.emit(message)
+
+    @Slot()
+    def _refresh_display(self):
+        """Show a fast draft immediately, then escalate to full quality."""
+        frame = self.app_state.current_frame
+        total = self._get_total_frames()
+        if total > 0:
+            frame = max(0, min(total - 1, frame))
+            if frame != self.app_state.current_frame:
+                self.app_state.current_frame = frame
+
+        self._sync_navigation_controls(frame)
+        self._set_display_labels()
+
+        om_frame = self._om_frame_for(frame)
+
+        # A cached pair is always full quality, so it can be shown directly.
+        if self._show_cached_pair(frame, om_frame):
+            return
+
+        if self._pipeline_adapter is None or not self._has_any_source():
+            self.preview_status_label.setText("Load HDR and OM sources")
+            return
+
+        self._escalate_timer.stop()
+        self._pipeline_adapter.cancel_full_preview()
+        self._request_frames(frame, om_frame, PREVIEW_DRAFT, self._draft_width())
+        self.preview_status_label.setText(f"Frame {frame}")
+
+        # Playback keeps the draft lane busy; escalate only once it settles.
+        if not self._is_playing and not self._scrubbing:
+            self._escalate_timer.start()
+
+    @Slot()
+    def _request_full_quality(self):
+        """Ask for the settled frame at full preview resolution."""
+        if self._pipeline_adapter is None or self._is_playing or self._scrubbing:
+            return
+        if not self._has_any_source():
+            return
+        frame = self.app_state.current_frame
+        self._request_frames(
+            frame, self._om_frame_for(frame), PREVIEW_FULL, self._full_width()
+        )
+
+    def _request_frames(self, frame: int, om_frame: int, quality: str, width: int):
+        self._pipeline_adapter.request_preview_frames(
+            self._source_request(self.app_state.hdr_source, width),
+            self._source_request(self.app_state.om_source, width),
+            frame,
+            om_frame,
+            self._preview_generation,
+            preview_width=width,
+            quality=quality,
+        )
+
+    def _om_frame_for(self, frame: int) -> int:
+        """Apply the shot-level sync offset to get the OM frame."""
         offset = 0
         if self.app_state.sync_proposal:
             offset = self.app_state.sync_proposal.offset
-        om_frame = max(0, frame + offset)
+        return max(0, frame + offset)
 
-        # Extract HDR frame
-        hdr_pixmap = self._get_frame_pixmap(
-            self.app_state.hdr_source, frame
-        )
-        # Extract OM frame (with offset)
-        om_pixmap = self._get_frame_pixmap(
-            self.app_state.om_source, om_frame
+    def _has_any_source(self) -> bool:
+        return bool(
+            (self.app_state.hdr_source and self.app_state.hdr_source.path)
+            or (self.app_state.om_source and self.app_state.om_source.path)
         )
 
-        # Update display
-        self.display_widget.set_hdr_frame(hdr_pixmap)
-        self.display_widget.set_om_frame(om_pixmap)
+    def _show_cached_pair(self, frame: int, om_frame: int) -> bool:
+        """Display a cached full-quality pair if both frames are present."""
+        if not (self.app_state.hdr_source and self.app_state.om_source):
+            return False
+        cached_hdr = self._frame_cache.get(self.app_state.hdr_source.path, frame)
+        cached_om = self._frame_cache.get(self.app_state.om_source.path, om_frame)
+        if cached_hdr is None or cached_om is None:
+            return False
+        self.display_widget.set_hdr_frame(QPixmap.fromImage(cached_hdr))
+        self.display_widget.set_om_frame(QPixmap.fromImage(cached_om))
+        self._displayed_frame = frame
+        self._displayed_quality = PREVIEW_FULL
+        self._update_quality_badge(PREVIEW_FULL)
+        return True
 
-        # Update labels
+    def _draft_width(self) -> int:
+        """Small target for interaction; smaller still while dragging."""
+        return 480 if self._scrubbing else 720
+
+    def _full_width(self) -> int:
+        """Target the visible area, capped by the source resolution."""
+        if self._zoom_fit_mode:
+            width = max(640, self.display_widget.width())
+            if self._current_mode == PreviewMode.SIDE_BY_SIDE:
+                width = max(640, width // 2)
+        else:
+            width = int(1920 * max(self._zoom_level, 1.0))
+        source = self.app_state.hdr_source or self.app_state.om_source
+        if source and source.width > 0:
+            width = min(width, source.width)
+        return max(2, int(width) // 2 * 2)
+
+    def _update_quality_badge(self, quality: str):
+        if quality == PREVIEW_FULL:
+            self.preview_status_label.setText("Full")
+            self.preview_status_label.setStyleSheet("color: #44cc44;")
+        else:
+            self.preview_status_label.setText("Draft")
+            self.preview_status_label.setStyleSheet("color: #ffaa00;")
+
+    @Slot()
+    def _on_scrub_started(self):
+        """Drop to draft quality while the timeline is being dragged."""
+        self._scrubbing = True
+        self._escalate_timer.stop()
+        if self._pipeline_adapter is not None:
+            self._pipeline_adapter.cancel_full_preview()
+
+    @Slot()
+    def _on_scrub_finished(self):
+        """Escalate to full quality once the timeline is released."""
+        self._scrubbing = False
+        if not self._is_playing:
+            self._escalate_timer.start()
+
+    def _source_request(self, source, preview_width: int):
+        """Convert GUI source metadata to a worker request."""
+        if source is None or not source.path:
+            return None
+        return {
+            "path": source.path,
+            "width": source.width,
+            "height": source.height,
+            "fps": source.fps,
+            "preview_width": preview_width,
+        }
+
+    def _set_display_labels(self):
         hdr_label = "HDR"
         om_label = "OpenMatte"
         if self.app_state.hdr_source:
@@ -669,70 +906,20 @@ class PreviewPanel(QWidget):
             om_label = f"OM: {self.app_state.om_source.filename}"
         self.display_widget.set_labels(hdr_label, om_label)
 
-        # Update spinbox without triggering signal
+    def _sync_navigation_controls(self, frame: int):
+        """Keep frame number, timecode, and slider synchronized."""
         self.frame_spinbox.blockSignals(True)
         self.frame_spinbox.setValue(frame)
         self.frame_spinbox.blockSignals(False)
-
-        # Update timecode display
+        self.frame_slider.blockSignals(True)
+        self.frame_slider.setValue(frame)
+        self.frame_slider.blockSignals(False)
         self.timecode_edit.setText(self._frame_to_timecode(frame))
 
-        # Prefetch adjacent frames for cache (current +/- 1)
-        self._prefetch_adjacent(frame, om_frame)
-
-    def _get_frame_pixmap(self, source, frame_number: int) -> Optional[QPixmap]:
-        """Extract a frame from source as QPixmap, using cache."""
-        if source is None or not source.path:
-            return None
-
-        path = source.path
-
-        # Check cache first
-        cached = self._frame_cache.get(path, frame_number)
-        if cached is not None:
-            return QPixmap.fromImage(cached)
-
-        # Extract via pipeline adapter
-        if self._pipeline_adapter is None:
-            return None
-
-        image = self._pipeline_adapter.extract_frame(path, frame_number, width=960)
-        if image is None:
-            return None
-
-        # Store in cache
-        self._frame_cache.put(path, frame_number, image)
-        return QPixmap.fromImage(image)
-
-    def _prefetch_adjacent(self, hdr_frame: int, om_frame: int):
-        """Prefetch frames at current +/- 1 into cache (non-blocking hint).
-
-        This is a simple eager fill: we only prefetch if not already cached.
-        Actual extraction is synchronous (subprocess per frame) but fast
-        for single frames.
-        """
-        if self._pipeline_adapter is None:
-            return
-
-        # Prefetch HDR +/- 1
-        if self.app_state.hdr_source and self.app_state.hdr_source.path:
-            hdr_path = self.app_state.hdr_source.path
-            for delta in (-1, 1):
-                adj = hdr_frame + delta
-                if adj >= 0 and self._frame_cache.get(hdr_path, adj) is None:
-                    img = self._pipeline_adapter.extract_frame(hdr_path, adj, width=960)
-                    if img is not None:
-                        self._frame_cache.put(hdr_path, adj, img)
-
-        # Prefetch OM +/- 1
-        if self.app_state.om_source and self.app_state.om_source.path:
-            om_path = self.app_state.om_source.path
-            for delta in (-1, 1):
-                adj = om_frame + delta
-                if adj >= 0 and self._frame_cache.get(om_path, adj) is None:
-                    img = self._pipeline_adapter.extract_frame(om_path, adj, width=960)
-                    if img is not None:
-                        self._frame_cache.put(om_path, adj, img)
+    def _get_fps(self) -> float:
+        if self.app_state.hdr_source and self.app_state.hdr_source.fps > 0:
+            return self.app_state.hdr_source.fps
+        return 24.0
 
     def _get_total_frames(self) -> int:
         """Get total frame count from HDR source."""
