@@ -254,10 +254,13 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.StandardButton.Save:
                 self._on_save_project()
+                self.pipeline_adapter.stop_preview()
                 event.accept()
             elif reply == QMessageBox.StandardButton.Discard:
+                self.pipeline_adapter.stop_preview()
                 event.accept()
             else:
                 event.ignore()
         else:
+            self.pipeline_adapter.stop_preview()
             event.accept()

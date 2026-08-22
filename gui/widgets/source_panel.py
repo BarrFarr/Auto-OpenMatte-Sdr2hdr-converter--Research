@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QGridLayout,
     QFileDialog,
-    QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
@@ -143,6 +142,8 @@ class SourcePanel(QWidget):
         super().__init__(parent)
         self.app_state = app_state
         self.adapter = adapter
+        self._pending_hdr_path = ""
+        self._pending_om_path = ""
 
         self._setup_ui()
         self._connect_signals()
@@ -246,6 +247,8 @@ class SourcePanel(QWidget):
 
         # State observation
         self.app_state.sources_changed.connect(self._refresh_display)
+        self.adapter.inspect_completed.connect(self._on_inspect_completed)
+        self.adapter.inspect_error.connect(self._on_inspect_error)
 
     @Slot()
     def _browse_hdr(self):
@@ -273,29 +276,48 @@ class SourcePanel(QWidget):
 
     @Slot(str)
     def _set_hdr_file(self, path: str):
-        """Set HDR source file and inspect it."""
+        """Queue HDR inspection without blocking the GUI thread."""
+        self._pending_hdr_path = path
+        self.hdr_drop.set_path(path)
         self.app_state.status_message.emit(f"Inspecting HDR: {path}")
-        info = self.adapter.inspect_file(path)
-        if info:
-            self.hdr_drop.set_path(path)
-            self.app_state.set_hdr_source(info)
-        else:
-            QMessageBox.warning(
-                self, "Error", f"Failed to inspect HDR source:\n{path}"
-            )
+        self.adapter.inspect_file_async(path)
 
     @Slot(str)
     def _set_om_file(self, path: str):
-        """Set OpenMatte source file and inspect it."""
+        """Queue OpenMatte inspection without blocking the GUI thread."""
+        self._pending_om_path = path
+        self.om_drop.set_path(path)
         self.app_state.status_message.emit(f"Inspecting OM: {path}")
-        info = self.adapter.inspect_file(path)
-        if info:
-            self.om_drop.set_path(path)
+        self.adapter.inspect_file_async(path)
+
+    @staticmethod
+    def _same_path(left: str, right: str) -> bool:
+        """Compare paths robustly across Windows case/separator rules."""
+        from pathlib import Path
+
+        try:
+            return Path(left).resolve() == Path(right).resolve()
+        except OSError:
+            return left == right
+
+    @Slot(object)
+    def _on_inspect_completed(self, info):
+        """Apply only the inspection result for the currently pending slot."""
+        if info is None:
+            return
+        if self._pending_hdr_path and self._same_path(info.path, self._pending_hdr_path):
+            self._pending_hdr_path = ""
+            self.app_state.set_hdr_source(info)
+            self.app_state.status_message.emit(f"HDR ready: {info.filename}")
+        elif self._pending_om_path and self._same_path(info.path, self._pending_om_path):
+            self._pending_om_path = ""
             self.app_state.set_om_source(info)
-        else:
-            QMessageBox.warning(
-                self, "Error", f"Failed to inspect OpenMatte source:\n{path}"
-            )
+            self.app_state.status_message.emit(f"OM ready: {info.filename}")
+
+    @Slot(str)
+    def _on_inspect_error(self, message: str):
+        """Report asynchronous ffprobe errors without freezing or crashing."""
+        self.app_state.status_message.emit(f"Source inspection failed: {message}")
 
     @Slot()
     def _clear_hdr(self):
