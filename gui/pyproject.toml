@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-openmatte-gui"
+version = "0.1.0"
+description = "GUI control surface for the Auto OpenMatte SDR-to-HDR pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+
+dependencies = [
+    "PySide6>=6.5",
+    "auto-openmatte",  # The backend pipeline package
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-qt>=4.0",
+]
+
+[project.scripts]
+openmatte-gui = "gui.__main__:main"
+
+[project.gui-scripts]
+openmatte-gui-win = "gui.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gui*"]
