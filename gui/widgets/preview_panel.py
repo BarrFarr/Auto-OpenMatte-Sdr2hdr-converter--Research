@@ -349,7 +349,7 @@ class PreviewPanel(QWidget):
         super().__init__(parent)
         self.app_state = app_state
         self._current_mode = PreviewMode.SIDE_BY_SIDE
-        self._zoom_fit = True
+        self._zoom_fit_mode = True
         self._zoom_level = 1.0
         self._pipeline_adapter = None  # Set via set_pipeline_adapter()
 
