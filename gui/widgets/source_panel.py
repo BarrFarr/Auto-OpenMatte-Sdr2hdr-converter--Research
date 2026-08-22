@@ -208,6 +208,31 @@ class SourcePanel(QWidget):
         validation_layout.addWidget(self.validation_label)
         main_layout.addWidget(validation_group)
 
+        # Backend Status section
+        backend_group = QGroupBox("Backend Status", self)
+        backend_layout = QGridLayout(backend_group)
+        backend_layout.setContentsMargins(4, 4, 4, 4)
+
+        self._backend_labels = {}
+        backend_fields = [
+            ("Backend", "backend_name"),
+            ("HW Decode", "hardware_decode"),
+            ("HW Encode", "hardware_encode"),
+            ("Zero-Copy", "zero_copy"),
+            ("Bridge DLL", "bridge_status"),
+        ]
+        for row, (display_name, key) in enumerate(backend_fields):
+            name_label = QLabel(f"{display_name}:", self)
+            name_label.setProperty("class", "field-name")
+            value_label = QLabel("-", self)
+            value_label.setProperty("class", "field-value")
+            backend_layout.addWidget(name_label, row, 0)
+            backend_layout.addWidget(value_label, row, 1)
+            self._backend_labels[key] = value_label
+
+        main_layout.addWidget(backend_group)
+        self._refresh_backend_status()
+
         main_layout.addStretch()
 
     def _connect_signals(self):
@@ -337,3 +362,60 @@ class SourcePanel(QWidget):
         else:
             self.validation_label.setText("Sources compatible")
             self.validation_label.setStyleSheet("color: #44cc44;")
+
+    def _refresh_backend_status(self):
+        """Query backend status and update the Backend Status group display."""
+        try:
+            status = self.adapter.get_backend_status()
+        except Exception:
+            status = {
+                "available": False,
+                "backend_name": "",
+                "hardware_decode": False,
+                "hardware_encode": False,
+                "zero_copy": False,
+                "supported_codecs": [],
+            }
+
+        if status.get("available"):
+            self._backend_labels["backend_name"].setText(
+                status.get("backend_name", "Unknown")
+            )
+            self._backend_labels["backend_name"].setStyleSheet("color: #44cc44;")
+        elif status.get("backend_name"):
+            self._backend_labels["backend_name"].setText(
+                f"{status['backend_name']} (not active)"
+            )
+            self._backend_labels["backend_name"].setStyleSheet("color: #ffaa00;")
+        else:
+            self._backend_labels["backend_name"].setText("Not available")
+            self._backend_labels["backend_name"].setStyleSheet("color: #888888;")
+
+        def _bool_label(value: bool) -> str:
+            return "Yes" if value else "No"
+
+        self._backend_labels["hardware_decode"].setText(
+            _bool_label(status.get("hardware_decode", False))
+        )
+        self._backend_labels["hardware_encode"].setText(
+            _bool_label(status.get("hardware_encode", False))
+        )
+        self._backend_labels["zero_copy"].setText(
+            _bool_label(status.get("zero_copy", False))
+        )
+
+        # Bridge DLL info
+        try:
+            bridge_info = self.adapter.get_bridge_info()
+        except Exception:
+            bridge_info = {"bridge_exists": False, "manifest_found": False}
+
+        if bridge_info.get("bridge_exists"):
+            self._backend_labels["bridge_status"].setText("Present")
+            self._backend_labels["bridge_status"].setStyleSheet("color: #44cc44;")
+        elif bridge_info.get("manifest_found"):
+            self._backend_labels["bridge_status"].setText("Manifest found, DLL missing")
+            self._backend_labels["bridge_status"].setStyleSheet("color: #ffaa00;")
+        else:
+            self._backend_labels["bridge_status"].setText("Not found")
+            self._backend_labels["bridge_status"].setStyleSheet("color: #888888;")

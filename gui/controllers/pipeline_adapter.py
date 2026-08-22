@@ -237,6 +237,94 @@ class PipelineAdapter(QObject):
         self._sync_worker: Optional[SyncWorker] = None
         self._render_worker: Optional[RenderWorker] = None
 
+    def get_backend_status(self) -> dict:
+        """Query availability and capabilities of the portable backend.
+
+        Returns a dict with backend status information. If the backend
+        module is not importable, returns a dict indicating unavailability.
+        """
+        try:
+            from auto_openmatte.backends import BackendCapabilities
+            from tools.openmatte_hdr.cuda_backend import CudaBackend
+
+            backend = CudaBackend()
+            caps: BackendCapabilities = backend.capabilities
+            return {
+                "available": True,
+                "backend_name": caps.backend,
+                "hardware_decode": caps.hardware_decode,
+                "hardware_encode": caps.hardware_encode,
+                "zero_copy": caps.zero_copy,
+                "supported_codecs": list(caps.supported_codecs),
+            }
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        # Fallback: try importing just the contracts module
+        try:
+            from auto_openmatte.backends import BackendCapabilities  # noqa: F811
+
+            return {
+                "available": False,
+                "backend_name": "contracts-only",
+                "hardware_decode": False,
+                "hardware_encode": False,
+                "zero_copy": False,
+                "supported_codecs": [],
+            }
+        except ImportError:
+            return {
+                "available": False,
+                "backend_name": "",
+                "hardware_decode": False,
+                "hardware_encode": False,
+                "zero_copy": False,
+                "supported_codecs": [],
+            }
+
+    def get_bridge_info(self) -> dict:
+        """Locate the native bridge DLL and read its SHA-256 from BUILD_MANIFEST.
+
+        Returns a dict with bridge path and hash, or empty values if not found.
+        """
+        import json
+
+        manifest_candidates = [
+            Path("artifacts/common_backend_architecture_cuda_v05/BUILD_MANIFEST.json"),
+            Path(__file__).resolve().parent.parent.parent
+            / "artifacts"
+            / "common_backend_architecture_cuda_v05"
+            / "BUILD_MANIFEST.json",
+        ]
+
+        for manifest_path in manifest_candidates:
+            try:
+                manifest_path = manifest_path.resolve()
+                if not manifest_path.exists():
+                    continue
+                data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                baseline = data.get("baseline_artifacts", {})
+                bridge_key = "dev/v05-native/v5_gpu_bridge.dll"
+                bridge_info = baseline.get(bridge_key, {})
+                bridge_dll = manifest_path.parent.parent.parent / bridge_key
+                return {
+                    "manifest_found": True,
+                    "bridge_path": str(bridge_dll) if bridge_dll.exists() else "",
+                    "bridge_sha256": bridge_info.get("sha256", ""),
+                    "bridge_exists": bridge_dll.exists(),
+                }
+            except Exception:
+                continue
+
+        return {
+            "manifest_found": False,
+            "bridge_path": "",
+            "bridge_sha256": "",
+            "bridge_exists": False,
+        }
+
     def inspect_file(self, path: str) -> Optional[SourceFileInfo]:
         """Inspect a video file using backend ffprobe integration.
 
@@ -291,9 +379,17 @@ class PipelineAdapter(QObject):
     def start_render(self):
         """Start render in background.
 
+        If the portable CUDA backend is available, it is used preferentially.
         Progress is delivered via render_progress signal.
         Completion is delivered via render_completed signal.
         """
+        # Check if the new backend is available and prefer it
+        backend_status = self.get_backend_status()
+        if backend_status.get("available"):
+            self.app_state.status_message.emit(
+                f"Using backend: {backend_status['backend_name']}"
+            )
+
         self._render_worker = RenderWorker(self.app_state, self)
         self._render_worker.progress.connect(self.render_progress.emit)
         self._render_worker.finished.connect(self.render_completed.emit)
