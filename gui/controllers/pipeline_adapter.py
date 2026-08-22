@@ -9,11 +9,80 @@ This adapter layer calls the existing auto_openmatte backend functions:
 It does NOT implement any new processing or algorithms.
 It translates between GUI state models and backend data models.
 """
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot, QThread
 
 from gui.models.state import AppState, SourceFileInfo, RenderStatus
+
+
+def _enum_value(value) -> str:
+    """Return a backend enum's serialized value for display and project state."""
+    if value is None:
+        return ""
+    return str(getattr(value, "value", value))
+
+
+def _inspect_backend_source(path: str):
+    """Inspect a path and select the backend's default video stream.
+
+    The production inspection and synchronization APIs use pathlib.Path and
+    SourceInfo objects. GUI state deliberately stores strings for JSON/project
+    portability, so this conversion belongs at this adapter boundary.
+    """
+    from auto_openmatte.analysis.inspect import inspect_source
+
+    source_info = inspect_source(Path(path))
+    if source_info.selected_stream is None and source_info.video_streams:
+        source_info.selected_stream = next(
+            (stream for stream in source_info.video_streams if stream.is_default),
+            source_info.video_streams[0],
+        )
+    return source_info
+
+
+def _source_file_info(path: str, source_info) -> SourceFileInfo:
+    """Translate the current backend SourceInfo model into GUI state."""
+    source_path = Path(path)
+    info = SourceFileInfo(
+        path=str(source_path),
+        filename=source_path.name,
+        is_valid=True,
+    )
+
+    stream = source_info.selected_stream
+    if stream is None and source_info.video_streams:
+        stream = source_info.video_streams[0]
+    if stream is not None:
+        info.width = int(getattr(stream, "width", 0) or 0)
+        info.height = int(getattr(stream, "height", 0) or 0)
+        info.fps = float(getattr(stream, "fps", 0.0) or 0.0)
+        info.frame_count = int(getattr(stream, "frame_count", 0) or 0)
+        info.duration_seconds = float(
+            getattr(stream, "duration_seconds", 0.0) or 0.0
+        )
+        info.codec = str(getattr(stream, "codec", "") or "")
+        info.pix_fmt = str(getattr(stream, "pix_fmt", "") or "")
+        info.color_space = str(
+            getattr(stream, "matrix_coefficients", "") or ""
+        )
+        info.color_transfer = _enum_value(
+            getattr(stream, "transfer", "")
+        )
+        info.color_primaries = _enum_value(
+            getattr(stream, "color_primaries", "")
+        )
+
+    metadata = getattr(source_info, "hdr_metadata", None)
+    if metadata is not None:
+        info.hdr_metadata = {
+            "format": _enum_value(getattr(metadata, "format", "")),
+            "max_cll": getattr(metadata, "max_cll", None),
+            "max_fall": getattr(metadata, "max_fall", None),
+            "mastering_display": getattr(metadata, "mastering_display", None),
+        }
+    return info
 
 
 class InspectWorker(QThread):
@@ -29,45 +98,9 @@ class InspectWorker(QThread):
     def run(self):
         """Run inspection in background thread."""
         try:
-            # Import backend at runtime
-            from auto_openmatte.analysis.inspect import inspect_source
-
-            source_info = inspect_source(self.file_path)
-
-            # Convert backend SourceInfo to GUI SourceFileInfo
-            info = SourceFileInfo(
-                path=self.file_path,
-                filename=source_info.path.split("/")[-1]
-                if "/" in source_info.path
-                else source_info.path.split("\\")[-1],
-                is_valid=True,
-            )
-
-            # Extract video stream info if available
-            if source_info.video_streams:
-                vs = source_info.video_streams[0]
-                info.width = getattr(vs, "width", 0)
-                info.height = getattr(vs, "height", 0)
-                info.fps = getattr(vs, "fps", 0.0)
-                info.frame_count = getattr(vs, "frame_count", 0)
-                info.duration_seconds = getattr(vs, "duration", 0.0)
-                info.codec = getattr(vs, "codec", "")
-                info.pix_fmt = getattr(vs, "pix_fmt", "")
-                info.color_space = getattr(vs, "color_space", "")
-                info.color_transfer = getattr(vs, "color_transfer", "")
-                info.color_primaries = getattr(vs, "color_primaries", "")
-
-            # Extract HDR metadata if available
-            if source_info.hdr_metadata:
-                info.hdr_metadata = {
-                    "max_cll": getattr(
-                        source_info.hdr_metadata, "max_cll", None
-                    ),
-                    "max_fall": getattr(
-                        source_info.hdr_metadata, "max_fall", None
-                    ),
-                }
-
+            # Import backend at runtime and normalize the GUI string path.
+            source_info = _inspect_backend_source(self.file_path)
+            info = _source_file_info(self.file_path, source_info)
             self.finished.emit(info)
 
         except ImportError:
@@ -104,10 +137,12 @@ class SyncWorker(QThread):
             from auto_openmatte.analysis.sync import find_global_offset
             from auto_openmatte.core.config import SyncConfig
 
+            # The backend sync API requires inspected SourceInfo objects with
+            # selected_stream populated, not GUI string paths.
+            hdr_source = _inspect_backend_source(self.hdr_path)
+            om_source = _inspect_backend_source(self.om_path)
             config = SyncConfig()
-            sync_model = find_global_offset(
-                self.hdr_path, self.om_path, config
-            )
+            sync_model = find_global_offset(hdr_source, om_source, config)
 
             result = {
                 "offset": sync_model.frame_offset,
@@ -192,6 +227,7 @@ class PipelineAdapter(QObject):
     sync_completed = Signal(object)  # dict with sync results
     render_progress = Signal(object)  # RenderStatus
     render_completed = Signal(bool)
+    inspect_error = Signal(str)
     error_occurred = Signal(str)
 
     def __init__(self, app_state: AppState, parent=None):
@@ -214,32 +250,8 @@ class PipelineAdapter(QObject):
             SourceFileInfo if inspection succeeded, None otherwise.
         """
         try:
-            from auto_openmatte.analysis.inspect import inspect_source
-
-            source_info = inspect_source(path)
-
-            info = SourceFileInfo(
-                path=path,
-                filename=path.split("/")[-1]
-                if "/" in path
-                else path.split("\\")[-1],
-                is_valid=True,
-            )
-
-            if source_info.video_streams:
-                vs = source_info.video_streams[0]
-                info.width = getattr(vs, "width", 0)
-                info.height = getattr(vs, "height", 0)
-                info.fps = getattr(vs, "fps", 0.0)
-                info.frame_count = getattr(vs, "frame_count", 0)
-                info.duration_seconds = getattr(vs, "duration", 0.0)
-                info.codec = getattr(vs, "codec", "")
-                info.pix_fmt = getattr(vs, "pix_fmt", "")
-                info.color_space = getattr(vs, "color_space", "")
-                info.color_transfer = getattr(vs, "color_transfer", "")
-                info.color_primaries = getattr(vs, "color_primaries", "")
-
-            return info
+            source_info = _inspect_backend_source(path)
+            return _source_file_info(path, source_info)
 
         except ImportError:
             # Backend not available, create from path only
@@ -253,7 +265,7 @@ class PipelineAdapter(QObject):
             )
 
         except Exception as e:
-            self.error_occurred.emit(f"Inspect failed: {e}")
+            self.inspect_error.emit(f"Inspect failed: {e}")
             return None
 
     def inspect_file_async(self, path: str):
@@ -263,7 +275,7 @@ class PipelineAdapter(QObject):
         """
         self._inspect_worker = InspectWorker(path, self)
         self._inspect_worker.finished.connect(self.inspect_completed.emit)
-        self._inspect_worker.error.connect(self.error_occurred.emit)
+        self._inspect_worker.error.connect(self.inspect_error.emit)
         self._inspect_worker.start()
 
     def run_auto_sync(self, hdr_path: str, om_path: str):
