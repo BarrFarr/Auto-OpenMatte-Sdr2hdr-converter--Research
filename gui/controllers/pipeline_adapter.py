@@ -5,14 +5,20 @@ This adapter layer calls the existing auto_openmatte backend functions:
 - inspect_source() for file inspection via ffprobe
 - find_global_offset() for auto-sync
 - render_extend() / render_convert_hdr() for rendering
+- extract_frame() for single-frame preview via ffmpeg subprocess
 
 It does NOT implement any new processing or algorithms.
 It translates between GUI state models and backend data models.
 """
+import os
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal, Slot, QThread
+from PySide6.QtGui import QImage
 
 from gui.models.state import AppState, SourceFileInfo, RenderStatus
 
@@ -83,6 +89,49 @@ def _source_file_info(path: str, source_info) -> SourceFileInfo:
             "mastering_display": getattr(metadata, "mastering_display", None),
         }
     return info
+
+
+def _find_ffmpeg() -> Optional[str]:
+    """Locate ffmpeg executable.
+
+    Search order:
+    1. Backend MediaToolLocator (bundled / dev tree / PATH)
+    2. shutil.which on PATH
+    3. Hardcoded Windows locations
+    """
+    # Try backend locator first
+    try:
+        from auto_openmatte.utils.ffmpeg import get_media_tool_config
+
+        config = get_media_tool_config()
+        if config.ffmpeg_found and config.ffmpeg_path is not None:
+            return str(config.ffmpeg_path)
+    except (ImportError, Exception):
+        pass
+
+    # Fallback: shutil.which
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    # Fallback: common Windows paths
+    if sys.platform == "win32":
+        candidates = [
+            Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
+            Path(r"C:\Program Files (x86)\ffmpeg\bin\ffmpeg.exe"),
+            Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "bin" / "ffmpeg.exe",
+        ]
+        # Also check relative dev path from this file
+        repo_root_candidate = Path(__file__).resolve().parent.parent.parent
+        dev_ffmpeg = repo_root_candidate / "dev" / "ffmpeg-build" / "install" / "bin" / "ffmpeg.exe"
+        candidates.insert(0, dev_ffmpeg)
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+
+    return None
 
 
 class InspectWorker(QThread):
@@ -354,6 +403,84 @@ class PipelineAdapter(QObject):
 
         except Exception as e:
             self.inspect_error.emit(f"Inspect failed: {e}")
+            return None
+
+    def extract_frame(
+        self, path: str, frame_number: int, width: int = 960
+    ) -> Optional[QImage]:
+        """Extract a single video frame as a QImage using ffmpeg subprocess.
+
+        Uses ffmpeg to decode one frame at the given frame number, output as
+        RGB24 rawvideo via pipe, and wraps the result in a QImage.
+
+        Args:
+            path: Path to the video file.
+            frame_number: 0-indexed frame number to extract.
+            width: Target width for scaling (height auto-calculated).
+
+        Returns:
+            QImage in RGB888 format, or None if extraction fails.
+        """
+        ffmpeg_path = _find_ffmpeg()
+        if ffmpeg_path is None:
+            return None
+
+        if not path or not Path(path).is_file():
+            return None
+
+        # Build ffmpeg command:
+        # -vf select=eq(n,FRAME_NUMBER),scale=WIDTH:-1
+        # Output single frame as RGB24 rawvideo to pipe
+        vf_filter = f"select=eq(n\\,{frame_number}),scale={width}:-1"
+
+        cmd = [
+            ffmpeg_path,
+            "-v", "quiet",
+            "-nostdin",
+            "-i", path,
+            "-vf", vf_filter,
+            "-frames:v", "1",
+            "-pix_fmt", "rgb24",
+            "-f", "rawvideo",
+            "pipe:1",
+        ]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+            if result.returncode != 0 or not result.stdout:
+                return None
+
+            raw_data = result.stdout
+            # Calculate height from raw data size: size = width * height * 3
+            expected_row_bytes = width * 3
+            if len(raw_data) < expected_row_bytes:
+                return None
+
+            height = len(raw_data) // expected_row_bytes
+            if height <= 0:
+                return None
+
+            # Trim any extra bytes (shouldn't happen but be safe)
+            expected_size = width * height * 3
+            raw_data = raw_data[:expected_size]
+
+            # Create QImage from raw RGB24 data
+            image = QImage(
+                raw_data,
+                width,
+                height,
+                width * 3,  # bytes per line
+                QImage.Format.Format_RGB888,
+            )
+            # Make a deep copy since raw_data buffer will be freed
+            return image.copy()
+
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return None
 
     def inspect_file_async(self, path: str):

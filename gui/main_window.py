@@ -123,6 +123,7 @@ class MainWindow(QMainWindow):
             self.app_state, self.sync_controller, self
         )
         self.preview_panel = PreviewPanel(self.app_state, self)
+        self.preview_panel.set_pipeline_adapter(self.pipeline_adapter)
         self.shot_lock_panel = ShotLockPanel(self.app_state, self)
         self.output_preview_panel = OutputPreviewPanel(self.app_state, self)
         self.quality_panel = QualityPanel(self.app_state, self)

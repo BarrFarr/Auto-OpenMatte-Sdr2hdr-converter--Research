@@ -1,0 +1,30 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Implement real frame preview using ffmpeg subprocess extraction. Replace placeholder rectangles with actual video frame rendering in all 4 display modes (side-by-side, overlay, wiper, checkerboard). Add extract_frame method to pipeline_adapter.py.",
+  "status": "in_progress",
+  "steps": [
+    "Add extract_frame(path, frame_number, width) -> QImage | None to pipeline_adapter.py using ffmpeg subprocess with RGB24 rawvideo pipe output",
+    "Rewrite preview_panel.py to use real frame extraction instead of placeholder text",
+    "Implement all 4 display modes: side-by-side (two QLabels), overlay (QPainter blend), wiper (vertical divider), checkerboard (64x64 blocks)",
+    "Add zoom fit and zoom 100% with scroll support",
+    "Implement 3-frame cache (current +/- 1) to limit RAM usage",
+    "Apply sync offset: HDR frame = current_frame, OM frame = current_frame + offset"
+  ],
+  "acceptance_criteria": [
+    "extract_frame returns QImage from ffmpeg subprocess or None on failure",
+    "ffmpeg located via backend MediaToolLocator, PATH fallback, then Windows hardcoded paths",
+    "All 4 preview modes render real frames when sources are loaded",
+    "Frame navigation triggers real extraction for both HDR and OM sources",
+    "Sync offset applied to OM frame number",
+    "Cache limited to 3 frames maximum",
+    "All Python files pass AST validation"
+  ],
+  "verification": [
+    "Run: find gui/ -name '*.py' -exec python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' {} \\;",
+    "Verify extract_frame method exists in pipeline_adapter.py",
+    "Verify preview_panel.py uses extract_frame and implements all 4 modes"
+  ],
+  "blocked_reason": null,
+  "findings": null
+}
