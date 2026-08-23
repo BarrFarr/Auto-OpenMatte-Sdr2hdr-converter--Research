@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from auto_openmatte.core.mode import ProcessingMode
 from gui.models.sync_state import ShotLock, SyncProposal
 
 
@@ -27,6 +28,7 @@ class ProjectFile:
     """
 
     version: str = "1.0"
+    processing_mode: str = ProcessingMode.EXTEND.value
     hdr_source_path: str = ""
     om_source_path: str = ""
     shot_locks: list = field(default_factory=list)  # List[ShotLock]
@@ -42,6 +44,7 @@ class ProjectFile:
         data = {
             "format": "omhdr",
             "version": self.version,
+            "processing_mode": ProcessingMode.coerce(self.processing_mode).value,
             "sources": {
                 "hdr_path": self.hdr_source_path,
                 "om_path": self.om_source_path,
@@ -102,6 +105,7 @@ class ProjectFile:
 
         return cls(
             version=data.get("version", "1.0"),
+            processing_mode=ProcessingMode.coerce(data.get("processing_mode")),
             hdr_source_path=sources.get("hdr_path", ""),
             om_source_path=sources.get("om_path", ""),
             shot_locks=shot_locks,
@@ -121,6 +125,15 @@ class ProjectFile:
             "crf": getattr(rc, "crf", 16),
             "pix_fmt": getattr(rc, "pix_fmt", "yuv420p10le"),
             "resolution": getattr(rc, "resolution", ""),
+            "backend_project_path": getattr(rc, "backend_project_path", ""),
+            "segment_frames": getattr(rc, "segment_frames", 120),
+            "checkpoint_path": getattr(rc, "checkpoint_path", ""),
+            "audio_source": getattr(rc, "audio_source", "NONE"),
+            "audio_stream_ordinal": getattr(rc, "audio_stream_ordinal", -1),
+            "audio_stream_index": getattr(rc, "audio_stream_index", -1),
+            "audio_codec": getattr(rc, "audio_codec", ""),
+            "audio_language": getattr(rc, "audio_language", ""),
+            "audio_title": getattr(rc, "audio_title", ""),
         }
 
     @classmethod
@@ -137,4 +150,13 @@ class ProjectFile:
             crf=data.get("crf", 16),
             pix_fmt=data.get("pix_fmt", "yuv420p10le"),
             resolution=data.get("resolution", ""),
+            backend_project_path=data.get("backend_project_path", ""),
+            segment_frames=int(data.get("segment_frames", 120)),
+            checkpoint_path=data.get("checkpoint_path", ""),
+            audio_source=str(data.get("audio_source", "NONE")),
+            audio_stream_ordinal=int(data.get("audio_stream_ordinal", -1)),
+            audio_stream_index=int(data.get("audio_stream_index", -1)),
+            audio_codec=str(data.get("audio_codec", "")),
+            audio_language=str(data.get("audio_language", "")),
+            audio_title=str(data.get("audio_title", "")),
         )

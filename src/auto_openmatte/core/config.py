@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass, field
 
+from auto_openmatte.core.mode import ProcessingMode
+
 
 @dataclass
 class SyncConfig:
@@ -62,9 +64,39 @@ class ColorConfig:
     feather_width: int = 4
 
 
+@dataclass(frozen=True)
+class TransformConfig:
+    """Named parameters and policies for the existing shot transform.
+
+    The values describe the current implementation; they do not introduce a
+    second color algorithm.  Keeping them in a model makes future curve,
+    matrix, gamut, extrapolation, and output-encoding replacements explicit.
+    """
+
+    sdr_transfer: str = "bt709"
+    hdr_transfer: str = "smpte2084"
+    peak_nits: float = 10000.0
+    gamut_matrix: str = "bt709_to_bt2020"
+    luminance_curve: str = "overlap_fitted_monotonic"
+    saturation_model: str = "shot_transform"
+    gamut_mapping: str = "nonnegative"
+    out_of_domain_policy: str = "clamp"
+    output_encoding: str = "pq"
+
+    def validate(self) -> None:
+        """Validate the currently supported policy boundary."""
+        if self.peak_nits <= 0:
+            raise ValueError("peak_nits must be positive")
+        if self.out_of_domain_policy != "clamp":
+            raise ValueError(
+                "Only the existing clamp out-of-domain policy is available; "
+                "select a future policy when its implementation is added"
+            )
+
+
 @dataclass
 class RenderConfig:
-    """Configuration for final render."""
+    """Configuration for final render and its selected processing mode."""
 
     # Output codec
     codec: str = "libx265"
@@ -72,8 +104,14 @@ class RenderConfig:
     crf: int = 16
     # Pixel format
     pix_fmt: str = "yuv420p10le"
+    # Optional output geometry, empty = source geometry
+    resolution: str = ""
     # Additional FFmpeg encoder params
     encoder_params: dict[str, str] = field(default_factory=dict)
+    # Project/shot apply mode; the renderer, not the GUI, consumes it.
+    processing_mode: ProcessingMode = ProcessingMode.EXTEND
+    # Existing transform parameters, kept separate from output/backend options.
+    transform: TransformConfig = field(default_factory=TransformConfig)
 
 
 @dataclass

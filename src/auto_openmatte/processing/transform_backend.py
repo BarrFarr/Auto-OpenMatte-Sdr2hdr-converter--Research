@@ -687,6 +687,56 @@ class GPUTransformBackend:
         output = workspace.cupy.asnumpy(buffers.output_flat)
         return output.reshape(buffers.shape)
 
+    def transform_device(
+        self,
+        om_frame: Any,
+        transform: ShotTransform,
+        *,
+        workspace: TransformWorkspace | None = None,
+        sdr_transfer: str = "bt709",
+        hdr_transfer: str = "smpte2084",
+        peak_nits: float = _PEAK_NITS,
+    ) -> Any:
+        """Apply the existing GPU transform to a device-resident RGB frame.
+
+        This method only exposes the already implemented GPU stages through a
+        device-memory boundary; it does not introduce another color path.
+        """
+        self._ensure_initialized()
+        if workspace is None:
+            workspace = self.prepare_shot(
+                transform,
+                sdr_transfer=sdr_transfer,
+                hdr_transfer=hdr_transfer,
+                peak_nits=peak_nits,
+            )
+        if not isinstance(workspace, GPUTransformWorkspace):
+            raise ValueError("workspace does not belong to the GPU backend")
+        expected = _transform_signature(
+            transform,
+            sdr_transfer=sdr_transfer,
+            hdr_transfer=hdr_transfer,
+            peak_nits=peak_nits,
+        )
+        if workspace.signature != expected or workspace.backend_name != self.name:
+            raise ValueError("workspace does not match the requested GPU transform")
+        shape = tuple(int(value) for value in om_frame.shape)
+        if len(shape) != 3 or shape[2] != 3 or shape[0] == 0 or shape[1] == 0:
+            raise ValueError("device RGB frame must have shape (height, width, 3)")
+        workspace.metadata["transform"] = transform
+        try:
+            with workspace.cupy.cuda.Device(self.device_id):
+                buffers = self._get_buffers(workspace, shape)
+                device_frame = workspace.cupy.asarray(om_frame, dtype=workspace.cupy.float64)
+                buffers.input_flat[...] = device_frame.reshape(-1, 3)
+                self._transform_device(workspace, buffers)
+                workspace.cupy.cuda.Stream.null.synchronize()
+                return buffers.output_flat.reshape(shape)
+        except BackendError:
+            raise
+        except Exception as exc:
+            raise BackendRuntimeError(f"GPU device transform failed for {shape}: {exc}") from exc
+
     def transform_roi(
         self,
         om_frame: np.ndarray,

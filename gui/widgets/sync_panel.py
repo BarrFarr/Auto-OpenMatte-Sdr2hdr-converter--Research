@@ -10,22 +10,22 @@ Auto-sync is treated as a PROPOSAL only. The user must explicitly confirm
 
 Offset is shot-level, not per-frame.
 """
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
+    QFrame,
+    QGridLayout,
     QGroupBox,
+    QHBoxLayout,
     QLabel,
     QPushButton,
     QSpinBox,
-    QGridLayout,
-    QFrame,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCore import Qt, Slot, Signal
 
-from gui.models.state import AppState
-from gui.models.sync_state import SyncProposal, SyncQuality, ShotLock, LockStatus
 from gui.controllers.sync_controller import SyncController
+from gui.models.state import AppState
+from gui.models.sync_state import SyncProposal, SyncQuality
 
 
 class OffsetComparisonWidget(QWidget):
@@ -124,6 +124,58 @@ class SyncPanel(QWidget):
         self.auto_sync_btn.setProperty("class", "primary-button")
         auto_layout.addWidget(self.auto_sync_btn)
 
+        # Optional bounded fast strategy
+        self.fast_sync_btn = QPushButton("FAST AUTO SYNC (GPU)", self)
+        self.fast_sync_btn.setProperty("class", "secondary-button")
+        auto_layout.addWidget(self.fast_sync_btn)
+
+        fast_info_layout = QGridLayout()
+        fast_info_layout.addWidget(QLabel("Fast scope:"), 0, 0)
+        self.fast_scope_label = QLabel("First 10 min / GPU-only", self)
+        fast_info_layout.addWidget(self.fast_scope_label, 0, 1)
+        fast_info_layout.addWidget(QLabel("Fast status:"), 1, 0)
+        self.fast_status_label = QLabel("Ready", self)
+        fast_info_layout.addWidget(self.fast_status_label, 1, 1)
+        fast_info_layout.addWidget(QLabel("Fast elapsed:"), 2, 0)
+        self.fast_elapsed_label = QLabel("--", self)
+        fast_info_layout.addWidget(self.fast_elapsed_label, 2, 1)
+        auto_layout.addLayout(fast_info_layout)
+
+        fast_diag_layout = QGridLayout()
+        fast_diag_layout.addWidget(QLabel("Fast confidence:"), 0, 0)
+        self.fast_confidence_label = QLabel("-", self)
+        fast_diag_layout.addWidget(self.fast_confidence_label, 0, 1)
+        fast_diag_layout.addWidget(QLabel("Fast diagnostic:"), 1, 0)
+        self.fast_diagnostic_status_label = QLabel("-", self)
+        fast_diag_layout.addWidget(self.fast_diagnostic_status_label, 1, 1)
+        fast_diag_layout.addWidget(QLabel("Best candidate:"), 2, 0)
+        self.fast_best_candidate_label = QLabel("-", self)
+        fast_diag_layout.addWidget(self.fast_best_candidate_label, 2, 1)
+        fast_diag_layout.addWidget(QLabel("2nd candidate:"), 3, 0)
+        self.fast_second_candidate_label = QLabel("-", self)
+        fast_diag_layout.addWidget(self.fast_second_candidate_label, 3, 1)
+        fast_diag_layout.addWidget(QLabel("Score margin:"), 4, 0)
+        self.fast_margin_label = QLabel("-", self)
+        fast_diag_layout.addWidget(self.fast_margin_label, 4, 1)
+        fast_diag_layout.addWidget(QLabel("Sample agreement:"), 5, 0)
+        self.fast_anchor_agreement_label = QLabel("-", self)
+        fast_diag_layout.addWidget(self.fast_anchor_agreement_label, 5, 1)
+        fast_diag_layout.addWidget(QLabel("Offset spread:"), 6, 0)
+        self.fast_spread_label = QLabel("-", self)
+        fast_diag_layout.addWidget(self.fast_spread_label, 6, 1)
+        fast_diag_layout.addWidget(QLabel("Verification:"), 7, 0)
+        self.fast_verification_label = QLabel("-", self)
+        fast_diag_layout.addWidget(self.fast_verification_label, 7, 1)
+        fast_diag_layout.addWidget(QLabel("Sample offsets:"), 8, 0)
+        self.fast_sample_offsets_label = QLabel("-", self)
+        self.fast_sample_offsets_label.setWordWrap(True)
+        fast_diag_layout.addWidget(self.fast_sample_offsets_label, 8, 1)
+        fast_diag_layout.addWidget(QLabel("Top 5:"), 9, 0)
+        self.fast_top5_label = QLabel("-", self)
+        self.fast_top5_label.setWordWrap(True)
+        fast_diag_layout.addWidget(self.fast_top5_label, 9, 1)
+        auto_layout.addLayout(fast_diag_layout)
+
         # Status display
         status_layout = QGridLayout()
         status_layout.addWidget(QLabel("Status:"), 0, 0)
@@ -217,6 +269,9 @@ class SyncPanel(QWidget):
     def _connect_signals(self):
         """Connect UI signals."""
         self.auto_sync_btn.clicked.connect(self._run_auto_sync)
+        self.fast_sync_btn.clicked.connect(self._run_fast_auto_sync)
+        self.sync_controller.sync_progress.connect(self._on_fast_sync_progress)
+        self.sync_controller.sync_finished.connect(self._on_sync_finished)
         self.minus_1_btn.clicked.connect(lambda: self._adjust_offset(-1))
         self.plus_1_btn.clicked.connect(lambda: self._adjust_offset(1))
         self.minus_10_btn.clicked.connect(lambda: self._adjust_offset(-10))
@@ -236,6 +291,34 @@ class SyncPanel(QWidget):
         self.sync_controller.run_auto_sync()
         self.auto_sync_btn.setEnabled(True)
 
+    @Slot()
+    def _run_fast_auto_sync(self):
+        """Invoke bounded Fast Auto Sync via the controller."""
+        self.fast_sync_btn.setEnabled(False)
+        self.fast_status_label.setText("Starting GPU-only path...")
+        self.fast_elapsed_label.setText("0.0 s")
+        if not self.sync_controller.run_fast_auto_sync():
+            self.fast_sync_btn.setEnabled(True)
+            self.fast_status_label.setText("Not started")
+            self.fast_elapsed_label.setText("--")
+
+    @Slot(object)
+    def _on_fast_sync_progress(self, payload):
+        """Display progress and elapsed time from Fast Auto Sync."""
+        if not isinstance(payload, dict) or payload.get("strategy") != "fast":
+            return
+        message = payload.get("message")
+        if message:
+            self.fast_status_label.setText(str(message))
+        elapsed = payload.get("elapsed_seconds")
+        if elapsed is not None:
+            self.fast_elapsed_label.setText(f"{float(elapsed):.1f} s")
+
+    @Slot()
+    def _on_sync_finished(self):
+        """Re-enable the fast button after either sync worker finishes."""
+        self.fast_sync_btn.setEnabled(True)
+
     @Slot(int)
     def _adjust_offset(self, delta: int):
         """Adjust the proposed offset by delta frames."""
@@ -251,6 +334,104 @@ class SyncPanel(QWidget):
     def _lock_offset(self):
         """Lock the current offset."""
         self.sync_controller.lock_current_offset()
+
+    def _refresh_fast_diagnostics(self, proposal: SyncProposal):
+        """Show bounded Fast Auto Sync evidence without changing lock state."""
+        diagnostics = proposal.fast_diagnostics
+        if not diagnostics:
+            for label in (
+                self.fast_confidence_label,
+                self.fast_diagnostic_status_label,
+                self.fast_best_candidate_label,
+                self.fast_second_candidate_label,
+                self.fast_margin_label,
+                self.fast_anchor_agreement_label,
+                self.fast_spread_label,
+                self.fast_verification_label,
+                self.fast_sample_offsets_label,
+                self.fast_top5_label,
+            ):
+                label.setText("-")
+            return
+
+        fast_confidence = proposal.fast_confidence
+        self.fast_confidence_label.setText(
+            f"{float(fast_confidence):.3f}" if fast_confidence is not None else "-"
+        )
+        diagnostic_status = proposal.fast_diagnostic_status or "FAST_REVIEW"
+        self.fast_diagnostic_status_label.setText(
+            f"{diagnostic_status} (diagnostic only)"
+        )
+        self.fast_diagnostic_status_label.setStyleSheet(
+            "color: #44cc44;"
+            if diagnostic_status == "FAST_LOCKED"
+            else "color: #ffaa00;"
+        )
+
+        best_offset = diagnostics.get("best_offset", "-")
+        best_score = diagnostics.get("best_score")
+        self.fast_best_candidate_label.setText(
+            f"{best_offset} / {float(best_score):.3f}"
+            if best_score is not None
+            else str(best_offset)
+        )
+        second_offset = diagnostics.get("second_best_offset", "-")
+        second_score = diagnostics.get("second_score")
+        self.fast_second_candidate_label.setText(
+            f"{second_offset} / {float(second_score):.3f}"
+            if second_score is not None
+            else str(second_offset)
+        )
+        margin = diagnostics.get("score_margin")
+        self.fast_margin_label.setText(
+            f"{float(margin):.3f}" if margin is not None else "-"
+        )
+
+        agreement_count = diagnostics.get("agreement_count", 0)
+        independent_count = diagnostics.get("independent_sample_count", 0)
+        agreement_percentage = diagnostics.get("agreement_percentage")
+        self.fast_anchor_agreement_label.setText(
+            f"{agreement_count}/{independent_count} "
+            f"({float(agreement_percentage) * 100:.1f}%)"
+            if agreement_percentage is not None
+            else "-"
+        )
+        spread = diagnostics.get("offset_spread_frames")
+        self.fast_spread_label.setText(
+            f"{float(spread):.1f} frames" if spread is not None else "-"
+        )
+
+        verification = diagnostics.get("verification", {})
+        post_score = verification.get("post_selection_score")
+        valid_samples = verification.get("post_selection_valid_frame_samples", 0)
+        independent_anchors = verification.get(
+            "post_selection_independent_anchors", 0
+        )
+        self.fast_verification_label.setText(
+            f"score={float(post_score):.3f}, "
+            f"anchors={independent_anchors}, frames={valid_samples}"
+            if post_score is not None
+            else "-"
+        )
+
+        sample_text = []
+        for sample in diagnostics.get("anchors", []):
+            sample_text.append(
+                f"S{sample.get('sample', '?')}="
+                f"{sample.get('best_offset', '?')}"
+            )
+        self.fast_sample_offsets_label.setText(
+            ", ".join(sample_text) if sample_text else "-"
+        )
+
+        candidate_text = []
+        for candidate in diagnostics.get("candidates", [])[:5]:
+            candidate_text.append(
+                f"#{candidate.get('rank', '?')} "
+                f"{candidate.get('offset', '?')} "
+                f"({float(candidate.get('score', 0.0)):.3f})"
+            )
+        self.fast_top5_label.setText(" | ".join(candidate_text) or "-")
 
     @Slot()
     def _refresh_display(self):
@@ -275,6 +456,7 @@ class SyncPanel(QWidget):
         # Update confidence and score
         self.confidence_label.setText(f"{proposal.confidence:.3f}")
         self.score_label.setText(f"{proposal.score:.4f}")
+        self._refresh_fast_diagnostics(proposal)
 
         # Update offset comparison
         self.offset_comparison.update_offsets(proposal)

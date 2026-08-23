@@ -9,7 +9,6 @@ ShotLock: User-confirmed sync decision for a specific shot
 """
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional
 
 
 class SyncQuality(Enum):
@@ -56,11 +55,25 @@ class SyncProposal:
     offset_minus_1: int = -1
     offset_plus_1: int = 1
     is_accepted: bool = False
+    # Optional Fast Auto Sync diagnostics; never used as ShotLock confidence.
+    fast_confidence: float | None = None
+    fast_diagnostic_status: str = ""
+    fast_diagnostics: dict = field(default_factory=dict)
+    fast_diagnostic_offset: int | None = None
 
     def __post_init__(self):
         """Ensure N-1 and N+1 are consistent with offset."""
         self.offset_minus_1 = self.offset - 1
         self.offset_plus_1 = self.offset + 1
+
+    def _mark_fast_diagnostic_stale(self):
+        """Mark fast evidence stale after a manual proposal offset edit."""
+        if (
+            self.fast_diagnostic_offset is not None
+            and self.offset != self.fast_diagnostic_offset
+            and self.fast_diagnostic_status
+        ):
+            self.fast_diagnostic_status = "FAST_REVIEW (manual offset)"
 
     def adjust_offset(self, delta: int):
         """Adjust the proposed offset by a delta value.
@@ -71,6 +84,7 @@ class SyncProposal:
         self.offset += delta
         self.offset_minus_1 = self.offset - 1
         self.offset_plus_1 = self.offset + 1
+        self._mark_fast_diagnostic_stale()
 
     def set_offset(self, new_offset: int):
         """Set an explicit offset value (manual entry).
@@ -81,6 +95,7 @@ class SyncProposal:
         self.offset = new_offset
         self.offset_minus_1 = self.offset - 1
         self.offset_plus_1 = self.offset + 1
+        self._mark_fast_diagnostic_stale()
 
     def to_dict(self) -> dict:
         """Serialize to dictionary for project save."""
@@ -90,6 +105,10 @@ class SyncProposal:
             "confidence": self.confidence,
             "quality": self.quality.value,
             "is_accepted": self.is_accepted,
+            "fast_confidence": self.fast_confidence,
+            "fast_diagnostic_status": self.fast_diagnostic_status,
+            "fast_diagnostics": self.fast_diagnostics,
+            "fast_diagnostic_offset": self.fast_diagnostic_offset,
         }
 
     @classmethod
@@ -102,6 +121,10 @@ class SyncProposal:
             confidence=data.get("confidence", 0.0),
             quality=quality,
             is_accepted=data.get("is_accepted", False),
+            fast_confidence=data.get("fast_confidence"),
+            fast_diagnostic_status=data.get("fast_diagnostic_status", ""),
+            fast_diagnostics=dict(data.get("fast_diagnostics", {})),
+            fast_diagnostic_offset=data.get("fast_diagnostic_offset"),
         )
 
 

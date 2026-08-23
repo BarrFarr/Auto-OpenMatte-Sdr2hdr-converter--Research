@@ -10,17 +10,26 @@ This adapter layer calls the existing auto_openmatte backend functions:
 It does NOT implement any new processing or algorithms.
 It translates between GUI state models and backend data models.
 """
-import os
+import logging
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QObject, Signal, Slot, QThread
+from PySide6.QtCore import QObject, QThread, Signal
 from PySide6.QtGui import QImage
 
-from gui.models.state import AppState, SourceFileInfo, RenderStatus
+from gui.models.state import (
+    AppState,
+    AudioTrackInfo,
+    RenderStatus,
+    SourceFileInfo,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _enum_value(value) -> str:
@@ -46,6 +55,27 @@ def _inspect_backend_source(path: str):
             source_info.video_streams[0],
         )
     return source_info
+
+
+def _probe_audio_tracks(path: str) -> list[AudioTrackInfo]:
+    """Probe selectable audio streams without changing video inspection."""
+    try:
+        from auto_openmatte.output.mux import probe_audio_tracks
+
+        return [AudioTrackInfo(
+            ordinal=int(track.get("ordinal", 0)),
+            global_index=int(track.get("global_index", 0)),
+            codec_name=str(track.get("codec_name", "")),
+            codec_long_name=str(track.get("codec_long_name", "")),
+            channels=int(track.get("channels", 0)),
+            channel_layout=str(track.get("channel_layout", "")),
+            sample_rate=int(track.get("sample_rate", 0)),
+            language=str(track.get("language", "")),
+            title=str(track.get("title", "")),
+            is_default=bool(track.get("default", False)),
+        ) for track in probe_audio_tracks(Path(path))]
+    except Exception:
+        return []
 
 
 def _source_file_info(path: str, source_info) -> SourceFileInfo:
@@ -88,6 +118,7 @@ def _source_file_info(path: str, source_info) -> SourceFileInfo:
             "max_fall": getattr(metadata, "max_fall", None),
             "mastering_display": getattr(metadata, "mastering_display", None),
         }
+    info.audio_tracks = _probe_audio_tracks(path)
     return info
 
 
@@ -196,17 +227,16 @@ class SyncWorker(QThread):
             result = {
                 "offset": sync_model.frame_offset,
                 "confidence": sync_model.confidence,
+                "frame_locked": bool(getattr(sync_model, "frame_locked", False)),
                 "status": sync_model.status.value
                 if hasattr(sync_model.status, "value")
                 else str(sync_model.status),
             }
             self.finished.emit(result)
 
-        except ImportError:
-            self.error.emit(
-                "Backend auto_openmatte not available. "
-                "Cannot run auto-sync without the backend installed."
-            )
+        except ImportError as exc:
+            logger.exception("Auto-sync backend import failed")
+            self.error.emit(f"Auto-sync backend import failed: {exc}")
             self.finished.emit(None)
 
         except Exception as e:
@@ -214,53 +244,207 @@ class SyncWorker(QThread):
             self.finished.emit(None)
 
 
+class FastSyncWorker(QThread):
+    """Worker for the optional first-ten-minute Fast Auto Sync strategy."""
+
+    finished = Signal(object)
+    progress = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, hdr_path: str, om_path: str, parent=None):
+        super().__init__(parent)
+        self.hdr_path = hdr_path
+        self.om_path = om_path
+
+    def run(self):
+        """Run bounded fast sync in the background thread."""
+        started = time.perf_counter()
+
+        def report(message: str):
+            self.progress.emit(
+                {
+                    "strategy": "fast",
+                    "message": message,
+                    "elapsed_seconds": time.perf_counter() - started,
+                }
+            )
+
+        try:
+            from auto_openmatte.analysis.gpu_fast_sync import (
+                find_fast_global_offset_gpu,
+            )
+            from auto_openmatte.core.config import SyncConfig
+
+            hdr_source = _inspect_backend_source(self.hdr_path)
+            om_source = _inspect_backend_source(self.om_path)
+            config = SyncConfig()
+            sync_model = find_fast_global_offset_gpu(
+                hdr_source,
+                om_source,
+                config,
+                progress_callback=report,
+            )
+            elapsed_seconds = time.perf_counter() - started
+            result = {
+                "offset": sync_model.frame_offset,
+                "confidence": sync_model.confidence,
+                "frame_locked": bool(getattr(sync_model, "frame_locked", False)),
+                "status": sync_model.status.value
+                if hasattr(sync_model.status, "value")
+                else str(sync_model.status),
+                "strategy": "fast",
+                "backend": "cuda-v05-native",
+                "gpu_only": True,
+                "method": getattr(sync_model, "method", ""),
+                "score": float(
+                    (getattr(sync_model, "fast_diagnostics", {}) or {}).get(
+                        "best_score", sync_model.confidence
+                    )
+                ),
+                "elapsed_seconds": elapsed_seconds,
+                "fast_confidence": getattr(sync_model, "fast_confidence", None),
+                "fast_diagnostic_status": getattr(
+                    sync_model, "fast_diagnostic_status", ""
+                ),
+                "fast_diagnostics": getattr(sync_model, "fast_diagnostics", {}),
+            }
+            self.finished.emit(result)
+
+        except ImportError as exc:
+            logger.exception("Fast auto-sync backend import failed")
+            self.error.emit(f"Fast auto-sync backend import failed: {exc}")
+            self.finished.emit(None)
+
+        except Exception as exc:
+            self.error.emit(str(exc))
+            self.finished.emit(None)
+
+
 class RenderWorker(QThread):
-    """Worker thread for render process."""
+    """Worker for the checkpointed segmented canonical renderer."""
 
     progress = Signal(object)  # RenderStatus
     finished = Signal(bool)  # success
     error = Signal(str)
 
-    def __init__(self, app_state: AppState, parent=None):
+    def __init__(self, app_state: AppState, *, resume: bool = False, parent=None):
         super().__init__(parent)
         self.app_state = app_state
-        self._should_stop = False
+        self._resume = bool(resume)
+        self._cancel_event = threading.Event()
+        self._pause_event = threading.Event()
+
+    def _emit_progress(
+        self,
+        current_frame: int,
+        total_frames: int,
+        mode: str,
+        output_path: str,
+        meta: dict | None = None,
+    ):
+        meta = meta or {}
+        percent = (100.0 * current_frame / total_frames) if total_frames else 0.0
+        self.progress.emit(
+            RenderStatus(
+                is_rendering=meta.get("state") not in {"PAUSED", "COMPLETE", "CANCELLED", "FAILED"},
+                progress_percent=percent,
+                current_frame=current_frame,
+                total_frames=total_frames,
+                output_path=output_path,
+                processing_mode=mode,
+                state=str(meta.get("state", "RUNNING")),
+                current_segment=meta.get("current_segment"),
+                total_segments=int(meta.get("total_segments", 0) or 0),
+                last_committed_frame=int(meta.get("last_committed_frame", -1) or -1),
+                checkpoint_path=str(meta.get("checkpoint_path", "")),
+            )
+        )
 
     def run(self):
-        """Run render in background thread."""
+        """Run one new or resumable checkpointed render job."""
+        success = False
         try:
-            from auto_openmatte.pipeline.render import render_extend
+            from auto_openmatte.core.config import RenderConfig as BackendRenderConfig
+            from auto_openmatte.core.mode import ProcessingMode
             from auto_openmatte.core.project import load_project
+            from auto_openmatte.pipeline.render_job import run_segmented_render
 
-            # Build backend project from GUI state
-            # This is a simplified call - actual integration will need
-            # full project data mapping
             rc = self.app_state.render_config
             output_path = rc.output_path
-
             if not output_path:
-                self.error.emit("No output path specified")
-                self.finished.emit(False)
-                return
+                raise ValueError("No output path specified")
 
-            # Note: Full render integration requires project data
-            # This is the adapter point where GUI state maps to backend calls
-            self.finished.emit(True)
+            backend_project = Path(rc.backend_project_path) if rc.backend_project_path else None
+            if backend_project is None and self.app_state.project_path:
+                sibling = Path(self.app_state.project_path).with_suffix(".json")
+                if sibling.is_file():
+                    backend_project = sibling
+            if backend_project is None or not backend_project.is_file():
+                raise ValueError(
+                    "No analyzed backend project.json selected. Set Backend Project "
+                    "to the canonical analysis project before rendering."
+                )
 
-        except ImportError:
-            self.error.emit(
-                "Backend auto_openmatte not available. "
-                "Cannot render without the backend installed."
+            mode = ProcessingMode.coerce(self.app_state.processing_mode)
+            project = load_project(backend_project)
+            project.processing_mode = mode
+            backend_config = BackendRenderConfig(
+                codec=rc.codec,
+                crf=rc.crf,
+                pix_fmt=rc.pix_fmt,
+                resolution=rc.resolution,
+                processing_mode=mode,
+                transform=project.transform_config,
             )
-            self.finished.emit(False)
+            # These lifecycle options are orchestration-only and are not read
+            # by fitting/compositing/CUDA code.
+            backend_config.segment_frames = max(1, int(rc.segment_frames))
+            backend_config.checkpoint_path = rc.checkpoint_path
 
-        except Exception as e:
-            self.error.emit(str(e))
-            self.finished.emit(False)
+            audio_type = str(rc.audio_source or "NONE").upper()
+            audio_selection = {
+                "type": audio_type,
+                "ordinal": int(rc.audio_stream_ordinal),
+                "global_index": int(rc.audio_stream_index),
+                "codec_name": rc.audio_codec,
+                "language": rc.audio_language,
+                "title": rc.audio_title,
+            }
+            if audio_type not in {"NONE", "HDR", "OM"}:
+                raise ValueError(f"Unsupported audio source: {audio_type}")
+            if audio_type != "NONE" and int(rc.audio_stream_ordinal) < 0:
+                raise ValueError("Select an audio track before rendering")
+
+            self._emit_progress(0, 0, mode.value, output_path)
+            result = run_segmented_render(
+                project,
+                Path(output_path),
+                backend_config,
+                project_path=self.app_state.project_path,
+                audio_selection=audio_selection,
+                resume=self._resume,
+                cancel_event=self._cancel_event,
+                pause_event=self._pause_event,
+                progress_callback=lambda current, total, meta: self._emit_progress(
+                    current, total, mode.value, output_path, meta
+                ),
+            )
+            success = bool(result)
+
+        except ImportError as exc:
+            self.error.emit(f"Render backend import failed: {exc}")
+        except Exception as exc:
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit(success)
 
     def request_stop(self):
-        """Request render cancellation."""
-        self._should_stop = True
+        """Request cancellation at the next safe frame/segment boundary."""
+        self._cancel_event.set()
+
+    def request_pause(self):
+        """Request a pause; the active segment is discarded safely."""
+        self._pause_event.set()
 
 
 class PipelineAdapter(QObject):
@@ -274,6 +458,7 @@ class PipelineAdapter(QObject):
 
     inspect_completed = Signal(object)  # SourceFileInfo
     sync_completed = Signal(object)  # dict with sync results
+    sync_progress = Signal(object)  # fast-sync progress payload
     render_progress = Signal(object)  # RenderStatus
     render_completed = Signal(bool)
     inspect_error = Signal(str)
@@ -293,18 +478,19 @@ class PipelineAdapter(QObject):
         module is not importable, returns a dict indicating unavailability.
         """
         try:
-            from auto_openmatte.backends import BackendCapabilities
-            from tools.openmatte_hdr.cuda_backend import CudaBackend
+            from auto_openmatte.preview.cuda_backend import CudaPreviewBackend
+            from tools.openmatte_hdr.cuda_backend import CUDA_CAPABILITIES
 
-            backend = CudaBackend()
-            caps: BackendCapabilities = backend.capabilities
+            capabilities = CudaPreviewBackend(device_id=0).capabilities
+            declared = CUDA_CAPABILITIES
             return {
-                "available": True,
-                "backend_name": caps.backend,
-                "hardware_decode": caps.hardware_decode,
-                "hardware_encode": caps.hardware_encode,
-                "zero_copy": caps.zero_copy,
-                "supported_codecs": list(caps.supported_codecs),
+                "available": bool(capabilities.available),
+                "backend_name": declared.backend,
+                "hardware_decode": bool(capabilities.hardware_decode),
+                "hardware_encode": declared.hardware_encode,
+                "zero_copy": declared.zero_copy,
+                "supported_codecs": list(declared.supported_codecs),
+                "reason": capabilities.reason,
             }
         except ImportError:
             pass
@@ -313,7 +499,7 @@ class PipelineAdapter(QObject):
 
         # Fallback: try importing just the contracts module
         try:
-            from auto_openmatte.backends import BackendCapabilities  # noqa: F811
+            import auto_openmatte.backends  # noqa: F401
 
             return {
                 "available": False,
@@ -503,27 +689,43 @@ class PipelineAdapter(QObject):
         self._sync_worker.error.connect(self.error_occurred.emit)
         self._sync_worker.start()
 
-    def start_render(self):
-        """Start render in background.
+    def run_fast_auto_sync(self, hdr_path: str, om_path: str):
+        """Start the optional first-ten-minute fast auto-sync strategy."""
+        self._sync_worker = FastSyncWorker(hdr_path, om_path, self)
+        self._sync_worker.finished.connect(self.sync_completed.emit)
+        self._sync_worker.progress.connect(self.sync_progress.emit)
+        self._sync_worker.error.connect(self.error_occurred.emit)
+        self._sync_worker.start()
 
-        If the portable CUDA backend is available, it is used preferentially.
-        Progress is delivered via render_progress signal.
-        Completion is delivered via render_completed signal.
-        """
-        # Check if the new backend is available and prefer it
+    def start_render(self, *, resume: bool = False):
+        """Start a new or resumable segmented render job."""
+        if self._render_worker is not None and self._render_worker.isRunning():
+            self.error_occurred.emit(
+                "A render job is already running; wait for it to stop before starting another."
+            )
+            return
         backend_status = self.get_backend_status()
         if backend_status.get("available"):
             self.app_state.status_message.emit(
                 f"Using backend: {backend_status['backend_name']}"
             )
 
-        self._render_worker = RenderWorker(self.app_state, self)
+        self._render_worker = RenderWorker(self.app_state, resume=resume, parent=self)
         self._render_worker.progress.connect(self.render_progress.emit)
         self._render_worker.finished.connect(self.render_completed.emit)
         self._render_worker.error.connect(self.error_occurred.emit)
         self._render_worker.start()
 
     def stop_render(self):
-        """Request render cancellation."""
+        """Request cancellation at a safe frame boundary."""
         if self._render_worker and self._render_worker.isRunning():
             self._render_worker.request_stop()
+
+    def pause_render(self):
+        """Request a safe checkpoint pause at the current segment boundary."""
+        if self._render_worker and self._render_worker.isRunning():
+            self._render_worker.request_pause()
+
+    def resume_render(self):
+        """Start a fresh worker that reconciles and resumes the checkpoint."""
+        self.start_render(resume=True)

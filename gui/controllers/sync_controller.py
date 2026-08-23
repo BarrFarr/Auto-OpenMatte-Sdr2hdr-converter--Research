@@ -13,14 +13,14 @@ It calls the backend and manages GUI state transitions.
 """
 from PySide6.QtCore import QObject, Signal, Slot
 
+from gui.controllers.pipeline_adapter import PipelineAdapter
 from gui.models.state import AppState
 from gui.models.sync_state import (
+    LockStatus,
+    ShotLock,
     SyncProposal,
     SyncQuality,
-    ShotLock,
-    LockStatus,
 )
-from gui.controllers.pipeline_adapter import PipelineAdapter
 
 
 class SyncController(QObject):
@@ -28,6 +28,7 @@ class SyncController(QObject):
 
     sync_started = Signal()
     sync_finished = Signal()
+    sync_progress = Signal(object)
     lock_confirmed = Signal(str)  # shot_id
 
     def __init__(
@@ -39,6 +40,7 @@ class SyncController(QObject):
 
         # Connect adapter signals
         self.adapter.sync_completed.connect(self._on_sync_completed)
+        self.adapter.sync_progress.connect(self._on_sync_progress)
         self.adapter.error_occurred.connect(self._on_error)
 
     def run_auto_sync(self):
@@ -64,6 +66,30 @@ class SyncController(QObject):
         self.sync_started.emit()
         self.app_state.status_message.emit("Running auto-sync...")
         self.adapter.run_auto_sync(hdr.path, om.path)
+
+    def run_fast_auto_sync(self) -> bool:
+        """Initiate bounded Fast Auto Sync as a proposal-only strategy."""
+        hdr = self.app_state.hdr_source
+        om = self.app_state.om_source
+
+        if not hdr or not om:
+            self.app_state.status_message.emit(
+                "Cannot fast-sync: both HDR and OM sources required"
+            )
+            return False
+
+        if not hdr.path or not om.path:
+            self.app_state.status_message.emit(
+                "Cannot fast-sync: source paths not set"
+            )
+            return False
+
+        self.sync_started.emit()
+        self.app_state.status_message.emit(
+            "Running Fast Auto Sync (First 10 min)..."
+        )
+        self.adapter.run_fast_auto_sync(hdr.path, om.path)
+        return True
 
     def adjust_offset(self, delta: int):
         """Adjust the current proposal offset by delta frames.
@@ -175,16 +201,64 @@ class SyncController(QObject):
             confidence=confidence,
             quality=quality,
             is_accepted=False,
+            fast_confidence=(
+                result.get("fast_confidence")
+                if result.get("strategy") == "fast"
+                else None
+            ),
+            fast_diagnostic_status=(
+                result.get("fast_diagnostic_status", "")
+                if result.get("strategy") == "fast"
+                else ""
+            ),
+            fast_diagnostics=(
+                dict(result.get("fast_diagnostics") or {})
+                if result.get("strategy") == "fast"
+                else {}
+            ),
+            fast_diagnostic_offset=(
+                result.get("offset")
+                if result.get("strategy") == "fast"
+                else None
+            ),
         )
         # Ensure N-1/N+1 are computed
         proposal.__post_init__()
 
         self.app_state.set_sync_proposal(proposal)
-        self.app_state.status_message.emit(
-            f"Auto-sync proposal: offset={proposal.offset}, "
-            f"confidence={proposal.confidence:.3f}, "
-            f"quality={proposal.quality.value}"
-        )
+        if result.get("strategy") == "fast":
+            elapsed = result.get("elapsed_seconds")
+            elapsed_text = (
+                f", elapsed={float(elapsed):.1f}s"
+                if elapsed is not None
+                else ""
+            )
+            fast_confidence = proposal.fast_confidence
+            fast_diagnostic_status = proposal.fast_diagnostic_status or "FAST_REVIEW"
+            fast_confidence_text = (
+                f", fast_confidence={float(fast_confidence):.3f}"
+                if fast_confidence is not None
+                else ""
+            )
+            self.app_state.status_message.emit(
+                f"Fast Auto Sync proposal (First 10 min): "
+                f"offset={proposal.offset}, "
+                f"confidence={proposal.confidence:.3f}, "
+                f"quality={proposal.quality.value}"
+                f"{fast_confidence_text}, diagnostic={fast_diagnostic_status}"
+                f"{elapsed_text}"
+            )
+        else:
+            self.app_state.status_message.emit(
+                f"Auto-sync proposal: offset={proposal.offset}, "
+                f"confidence={proposal.confidence:.3f}, "
+                f"quality={proposal.quality.value}"
+            )
+
+    @Slot(object)
+    def _on_sync_progress(self, payload):
+        """Forward optional strategy progress to the sync panel."""
+        self.sync_progress.emit(payload)
 
     @Slot(str)
     def _on_error(self, message: str):

@@ -7,6 +7,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from auto_openmatte.core.config import TransformConfig
+from auto_openmatte.core.mode import ProcessingMode
+
 
 class HDRFormat(Enum):
     """Detected HDR format."""
@@ -143,6 +146,10 @@ class SyncModel:
     method: str = "image_based_frame_offset"
     # Validation checkpoints: list of (hdr_frame, expected_om_frame, actual_similarity)
     checkpoints: list[dict[str, Any]] = field(default_factory=list)
+    # Optional diagnostics from the bounded Fast Auto Sync proposal strategy.
+    fast_confidence: float | None = None
+    fast_diagnostic_status: str = ""
+    fast_diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -182,6 +189,8 @@ class Shot:
     cut_type: str = "hard"  # "hard", "fade", "dissolve"
     # Confidence of cut detection
     confidence: float = 1.0
+    # Optional shot-level override; None inherits the project mode.
+    processing_mode: ProcessingMode | None = None
 
 
 @dataclass
@@ -213,6 +222,10 @@ class ProjectData:
 
     # Version
     version: str = "1.0"
+    # Project-level apply mode; a shot may override it.
+    processing_mode: ProcessingMode = ProcessingMode.EXTEND
+    # Named transform policies used by the apply boundary.
+    transform_config: TransformConfig = field(default_factory=TransformConfig)
     # Sources
     hdr_source: SourceInfo | None = None
     openmatte_source: SourceInfo | None = None

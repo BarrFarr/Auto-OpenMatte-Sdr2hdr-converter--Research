@@ -11,7 +11,13 @@ from numpy.typing import NDArray
 
 from auto_openmatte.core.models import GeometryModel, ShotTransform
 from auto_openmatte.processing.luminance import build_curve_lut
-from auto_openmatte.processing.transform import apply_shot_transform
+from auto_openmatte.processing.transform import (
+    apply_shot_transform as _cpu_apply_shot_transform,
+)
+from auto_openmatte.processing.transform_backend import (
+    TransformBackend,
+    TransformWorkspace,
+)
 
 
 def composite_extend(
@@ -24,6 +30,8 @@ def composite_extend(
     hdr_transfer: str = "smpte2084",
     peak_nits: float = 10000.0,
     prebuilt_lut: dict | None = None,
+    backend: TransformBackend | None = None,
+    backend_workspace: TransformWorkspace | None = None,
 ) -> NDArray[np.floating]:
     """Composite Mode A: HDR center + transformed OM extension.
 
@@ -45,6 +53,33 @@ def composite_extend(
     Returns:
         Composited frame (om_h, om_w, 3) in HDR signal domain [0, 1].
     """
+    def apply_shot_transform(
+        frame: NDArray[np.floating],
+        shot_transform: ShotTransform,
+        *,
+        sdr_transfer: str,
+        hdr_transfer: str,
+        peak_nits: float,
+        prebuilt_lut: dict | None,
+    ) -> NDArray[np.floating]:
+        if backend is not None:
+            return backend.transform_roi(
+                frame,
+                shot_transform,
+                workspace=backend_workspace,
+                sdr_transfer=sdr_transfer,
+                hdr_transfer=hdr_transfer,
+                peak_nits=peak_nits,
+            )
+        return _cpu_apply_shot_transform(
+            frame,
+            shot_transform,
+            sdr_transfer=sdr_transfer,
+            hdr_transfer=hdr_transfer,
+            peak_nits=peak_nits,
+            prebuilt_lut=prebuilt_lut,
+        )
+
     om_h, om_w = om_frame.shape[:2]
 
     # Build LUT once for this composition (all apply_shot_transform calls reuse it)
@@ -173,7 +208,7 @@ def composite_convert_hdr(
     Returns:
         HDR frame (H, W, 3) in HDR signal domain [0, 1].
     """
-    return apply_shot_transform(
+    return _cpu_apply_shot_transform(
         om_frame, transform,
         sdr_transfer=sdr_transfer,
         hdr_transfer=hdr_transfer,

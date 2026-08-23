@@ -7,7 +7,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from auto_openmatte.core.config import TransformConfig
 from auto_openmatte.core.exceptions import ProjectError
+from auto_openmatte.core.mode import ProcessingMode
 from auto_openmatte.core.models import (
     ColorPrimaries,
     FrameRateType,
@@ -120,6 +122,11 @@ def _rebuild_shot(data: dict[str, Any]) -> Shot:
         duration_frames=data.get("duration_frames", 0),
         cut_type=data.get("cut_type", "hard"),
         confidence=data.get("confidence", 1.0),
+        processing_mode=(
+            ProcessingMode.coerce(data["processing_mode"])
+            if data.get("processing_mode") is not None
+            else None
+        ),
     )
 
 
@@ -149,6 +156,9 @@ def load_project(path: Path) -> ProjectData:
 
     project = ProjectData()
     project.version = data.get("version", "1.0")
+    project.processing_mode = ProcessingMode.coerce(data.get("processing_mode"))
+    transform_data = data.get("transform_config", {})
+    project.transform_config = TransformConfig(**transform_data)
     project.hdr_source = _rebuild_source(data.get("hdr_source"))
     project.openmatte_source = _rebuild_source(data.get("openmatte_source"))
     project.sync_model = _rebuild_sync(data.get("sync_model", {}))

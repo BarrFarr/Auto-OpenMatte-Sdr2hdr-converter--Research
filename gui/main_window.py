@@ -36,6 +36,7 @@ from gui.widgets.render_panel import RenderPanel
 from gui.controllers.pipeline_adapter import PipelineAdapter
 from gui.controllers.sync_controller import SyncController
 from gui.controllers.render_controller import RenderController
+from gui.controllers.preview_controller import PreviewController
 
 
 class MainWindow(QMainWindow):
@@ -53,6 +54,7 @@ class MainWindow(QMainWindow):
         self.pipeline_adapter = PipelineAdapter(self.app_state)
         self.sync_controller = SyncController(self.app_state, self.pipeline_adapter)
         self.render_controller = RenderController(self.app_state, self.pipeline_adapter)
+        self.preview_controller = PreviewController(self.app_state, self)
 
         # Setup UI
         self._setup_menu_bar()
@@ -124,6 +126,7 @@ class MainWindow(QMainWindow):
         )
         self.preview_panel = PreviewPanel(self.app_state, self)
         self.preview_panel.set_pipeline_adapter(self.pipeline_adapter)
+        self.preview_panel.set_preview_controller(self.preview_controller)
         self.shot_lock_panel = ShotLockPanel(self.app_state, self)
         self.output_preview_panel = OutputPreviewPanel(self.app_state, self)
         self.quality_panel = QualityPanel(self.app_state, self)
@@ -243,6 +246,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close with unsaved changes check."""
+        should_close = True
         if self.app_state.is_dirty:
             reply = QMessageBox.question(
                 self,
@@ -254,10 +258,10 @@ class MainWindow(QMainWindow):
             )
             if reply == QMessageBox.StandardButton.Save:
                 self._on_save_project()
-                event.accept()
-            elif reply == QMessageBox.StandardButton.Discard:
-                event.accept()
-            else:
-                event.ignore()
-        else:
+            elif reply == QMessageBox.StandardButton.Cancel:
+                should_close = False
+        if should_close:
+            self.preview_controller.close()
             event.accept()
+        else:
+            event.ignore()

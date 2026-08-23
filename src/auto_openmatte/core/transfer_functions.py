@@ -56,6 +56,22 @@ def pq_oetf(luminance: NDArray[np.floating]) -> NDArray[np.floating]:
     return signal
 
 
+# The GPU transform indexes this table by sqrt(normalized luminance).  Sampling
+# the domain that way concentrates entries near black while preserving the
+# exact PQ OETF at every lookup point; linear interpolation then replaces a
+# per-pixel transcendental evaluation with a small device-resident LUT.
+_PQ_OETF_SQRT_LUT_SIZE = 65536
+
+
+def _get_pq_oetf_sqrt_lut() -> NDArray[np.float64]:
+    """Return PQ OETF values sampled on a sqrt-luminance lookup domain."""
+    sqrt_position = np.linspace(
+        0.0, 1.0, _PQ_OETF_SQRT_LUT_SIZE, dtype=np.float64
+    )
+    normalized_luminance = np.square(sqrt_position)
+    return pq_oetf(normalized_luminance * _PQ_PEAK_LUMINANCE)
+
+
 # ============================================================
 # HLG (ARIB STD-B67) — Hybrid Log-Gamma
 # ============================================================

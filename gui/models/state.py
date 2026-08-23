@@ -11,7 +11,35 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+from auto_openmatte.core.mode import ProcessingMode
 from gui.models.sync_state import SyncProposal, ShotLock
+
+
+@dataclass
+class AudioTrackInfo:
+    """Metadata for one selectable audio stream."""
+
+    ordinal: int = 0
+    global_index: int = 0
+    codec_name: str = ""
+    codec_long_name: str = ""
+    channels: int = 0
+    channel_layout: str = ""
+    sample_rate: int = 0
+    language: str = ""
+    title: str = ""
+    is_default: bool = False
+
+    @property
+    def label(self) -> str:
+        parts = [self.codec_name or "audio"]
+        if self.language:
+            parts.append(self.language)
+        if self.title:
+            parts.append(self.title)
+        if self.channels:
+            parts.append(f"{self.channels}ch")
+        return " / ".join(parts)
 
 
 @dataclass
@@ -31,6 +59,7 @@ class SourceFileInfo:
     color_transfer: str = ""
     color_primaries: str = ""
     hdr_metadata: Optional[dict] = None
+    audio_tracks: list[AudioTrackInfo] = field(default_factory=list)
     is_valid: bool = False
     validation_error: str = ""
 
@@ -48,7 +77,13 @@ class RenderStatus:
     elapsed_seconds: float = 0.0
     vram_usage_mb: float = 0.0
     output_path: str = ""
+    processing_mode: str = ProcessingMode.EXTEND.value
     error_message: str = ""
+    state: str = "IDLE"
+    current_segment: int | None = None
+    total_segments: int = 0
+    last_committed_frame: int = -1
+    checkpoint_path: str = ""
 
 
 @dataclass
@@ -72,6 +107,15 @@ class RenderConfig:
     crf: int = 16
     pix_fmt: str = "yuv420p10le"
     resolution: str = ""  # empty = source resolution
+    backend_project_path: str = ""  # canonical analyzed backend project.json
+    segment_frames: int = 120
+    checkpoint_path: str = ""
+    audio_source: str = "NONE"  # NONE, HDR, or OM
+    audio_stream_ordinal: int = -1
+    audio_stream_index: int = -1
+    audio_codec: str = ""
+    audio_language: str = ""
+    audio_title: str = ""
 
 
 class AppState(QObject):
@@ -88,6 +132,8 @@ class AppState(QObject):
     render_status_changed = Signal()
     quality_changed = Signal()
     preview_frame_changed = Signal()
+    processing_mode_changed = Signal()
+    preview_quality_changed = Signal()
     status_message = Signal(str)
 
     def __init__(self, parent=None):
@@ -97,6 +143,10 @@ class AppState(QObject):
         self.project_path: Optional[str] = None
         self.project_version: str = "1.0"
         self.is_dirty: bool = False
+
+        # Project processing mode (independent from sync state)
+        self.processing_mode: ProcessingMode = ProcessingMode.EXTEND
+        self.preview_quality: str = "DRAFT"
 
         # Sources
         self.hdr_source: Optional[SourceFileInfo] = None
@@ -125,6 +175,8 @@ class AppState(QObject):
         self.om_source = None
         self.sync_proposal = None
         self.shot_locks = []
+        self.processing_mode = ProcessingMode.EXTEND
+        self.preview_quality = "DRAFT"
         self.current_frame = 0
         self.current_shot_index = 0
         self.render_config = RenderConfig()
@@ -134,6 +186,8 @@ class AppState(QObject):
         self.sources_changed.emit()
         self.sync_changed.emit()
         self.shots_changed.emit()
+        self.processing_mode_changed.emit()
+        self.preview_quality_changed.emit()
 
     def load_project(self, path: str) -> bool:
         """Load project from .omhdr file.
@@ -155,6 +209,7 @@ class AppState(QObject):
             self.sources_changed.emit()
             self.sync_changed.emit()
             self.shots_changed.emit()
+            self.processing_mode_changed.emit()
             return True
         except Exception as e:
             self.status_message.emit(f"Load failed: {e}")
@@ -218,6 +273,26 @@ class AppState(QObject):
         self.shots_changed.emit()
         self.project_changed.emit()
 
+    def set_processing_mode(self, mode: ProcessingMode | str):
+        """Set the project-level apply mode without touching synchronization."""
+        normalized = ProcessingMode.coerce(mode)
+        if normalized == self.processing_mode:
+            return
+        self.processing_mode = normalized
+        self.is_dirty = True
+        self.processing_mode_changed.emit()
+        self.project_changed.emit()
+
+    def set_preview_quality(self, quality: str):
+        """Set the explicit preview quality badge (DRAFT or FULL)."""
+        normalized = str(quality).upper()
+        if normalized not in {"DRAFT", "FULL"}:
+            raise ValueError("Preview quality must be DRAFT or FULL")
+        if normalized == self.preview_quality:
+            return
+        self.preview_quality = normalized
+        self.preview_quality_changed.emit()
+
     def set_current_frame(self, frame: int):
         """Update current preview frame."""
         if frame < 0:
@@ -238,6 +313,7 @@ class AppState(QObject):
     def _apply_project_data(self, project_file):
         """Apply loaded project data to state."""
         self.project_version = project_file.version
+        self.processing_mode = ProcessingMode.coerce(project_file.processing_mode)
 
         if project_file.hdr_source_path:
             self.hdr_source = SourceFileInfo(
@@ -261,6 +337,7 @@ class AppState(QObject):
 
         return ProjectFile(
             version=self.project_version,
+            processing_mode=self.processing_mode.value,
             hdr_source_path=self.hdr_source.path if self.hdr_source else "",
             om_source_path=self.om_source.path if self.om_source else "",
             shot_locks=list(self.shot_locks),

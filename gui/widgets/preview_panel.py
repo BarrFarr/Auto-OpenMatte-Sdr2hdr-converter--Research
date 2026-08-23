@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Slot, Signal, QSize
 from PySide6.QtGui import QPixmap, QPainter, QColor, QImage
 
+from auto_openmatte.preview.models import PreviewFrame, PreviewMode as EnginePreviewMode, PreviewQuality
 from gui.models.state import AppState
 
 
@@ -352,12 +353,71 @@ class PreviewPanel(QWidget):
         self._zoom_fit_mode = True
         self._zoom_level = 1.0
         self._pipeline_adapter = None  # Set via set_pipeline_adapter()
+        self._preview_controller = None  # Set via set_preview_controller()
+        self._engine_preview_mode = EnginePreviewMode.SOURCE_HDR
+        self._engine_quality = PreviewQuality.DRAFT
 
         # Frame cache: max 6 entries (3 per source: current +/- 1)
         self._frame_cache = FrameCache(max_size=6)
 
         self._setup_ui()
         self._connect_signals()
+
+    def set_preview_controller(self, controller):
+        """Attach the independent GPU preview controller."""
+        self._preview_controller = controller
+        controller.frame_ready.connect(self._on_engine_frame)
+        controller.error.connect(self._on_engine_error)
+        controller.status.connect(self._on_engine_status)
+
+    def _request_engine_preview(self):
+        """Request the selected single-frame GPU preview."""
+        if self._preview_controller is None:
+            return
+        viewport_width = max(2, self.display_widget.width())
+        viewport_height = max(2, self.display_widget.height())
+        if self._engine_quality == PreviewQuality.DRAFT:
+            viewport_width = max(2, viewport_width // 2)
+            viewport_height = max(2, viewport_height // 2)
+        self._preview_controller.request_preview(
+            self._engine_preview_mode,
+            self._engine_quality,
+            target_width=viewport_width,
+            target_height=viewport_height,
+        )
+
+    @Slot(object)
+    def _on_engine_frame(self, frame: PreviewFrame):
+        """Display only the small host frame produced by the GPU backend."""
+        image = QImage(
+            frame.rgb24,
+            frame.width,
+            frame.height,
+            frame.width * 3,
+            QImage.Format.Format_RGB888,
+        ).copy()
+        pixmap = QPixmap.fromImage(image)
+        if frame.source_role == EnginePreviewMode.SOURCE_HDR:
+            self.display_widget.set_hdr_frame(pixmap)
+            self.display_widget.set_om_frame(None)
+            self.display_widget.set_labels("SOURCE HDR", "")
+        else:
+            self.display_widget.set_hdr_frame(None)
+            self.display_widget.set_om_frame(pixmap)
+            label = "CORRECTED OM" if frame.source_role == EnginePreviewMode.CORRECTED_OM else "SOURCE OM"
+            self.display_widget.set_labels("", label)
+        self._engine_status_label.setText(
+            f"{frame.source_role.value} · {frame.quality.value} · "
+            f"frame {frame.frame_number} · offset {frame.locked_offset}"
+        )
+
+    @Slot(str)
+    def _on_engine_error(self, message: str):
+        self._engine_status_label.setText(f"GPU preview unavailable: {message}")
+
+    @Slot(str)
+    def _on_engine_status(self, message: str):
+        self._engine_status_label.setText(message)
 
     def set_pipeline_adapter(self, adapter):
         """Set the pipeline adapter for frame extraction.
@@ -382,6 +442,27 @@ class PreviewPanel(QWidget):
         self.mode_combo.addItem("Wiper", PreviewMode.WIPER)
         self.mode_combo.addItem("Checkerboard", PreviewMode.CHECKERBOARD)
         toolbar_layout.addWidget(self.mode_combo)
+
+        # Single-frame backend preview selection (independent from display layout)
+        toolbar_layout.addSpacing(12)
+        toolbar_layout.addWidget(QLabel("GPU Preview:"))
+        self.engine_mode_combo = QComboBox(self)
+        self.engine_mode_combo.addItem("SOURCE HDR", EnginePreviewMode.SOURCE_HDR)
+        self.engine_mode_combo.addItem("SOURCE OM", EnginePreviewMode.SOURCE_OM)
+        self.engine_mode_combo.addItem("CORRECTED OM", EnginePreviewMode.CORRECTED_OM)
+        toolbar_layout.addWidget(self.engine_mode_combo)
+
+        toolbar_layout.addWidget(QLabel("Quality:"))
+        self.engine_quality_combo = QComboBox(self)
+        self.engine_quality_combo.addItem("DRAFT", PreviewQuality.DRAFT)
+        self.engine_quality_combo.addItem("FULL", PreviewQuality.FULL)
+        toolbar_layout.addWidget(self.engine_quality_combo)
+        self.engine_quality_badge = QLabel("DRAFT", self)
+        self.engine_quality_badge.setProperty("class", "preview-badge")
+        toolbar_layout.addWidget(self.engine_quality_badge)
+        self._engine_status_label = QLabel("GPU preview: not requested", self)
+        self._engine_status_label.setWordWrap(True)
+        toolbar_layout.addWidget(self._engine_status_label)
 
         toolbar_layout.addSpacing(10)
 
@@ -492,6 +573,8 @@ class PreviewPanel(QWidget):
         """Connect UI signals."""
         # Mode selection
         self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self.engine_mode_combo.currentIndexChanged.connect(self._on_engine_mode_changed)
+        self.engine_quality_combo.currentIndexChanged.connect(self._on_engine_quality_changed)
 
         # Overlay opacity
         self.opacity_slider.valueChanged.connect(self._on_opacity_changed)
@@ -519,6 +602,18 @@ class PreviewPanel(QWidget):
         # State observation
         self.app_state.preview_frame_changed.connect(self._refresh_display)
         self.app_state.sources_changed.connect(self._on_sources_changed)
+
+    @Slot(int)
+    def _on_engine_mode_changed(self, index: int):
+        self._engine_preview_mode = self.engine_mode_combo.itemData(index)
+        self._request_engine_preview()
+
+    @Slot(int)
+    def _on_engine_quality_changed(self, index: int):
+        self._engine_quality = self.engine_quality_combo.itemData(index)
+        self.engine_quality_badge.setText(self._engine_quality.value)
+        self.app_state.set_preview_quality(self._engine_quality.value)
+        self._request_engine_preview()
 
     @Slot(int)
     def _on_mode_changed(self, index: int):
@@ -638,10 +733,19 @@ class PreviewPanel(QWidget):
 
     @Slot()
     def _refresh_display(self):
-        """Refresh frame display by extracting real frames."""
+        """Refresh the selected single-frame preview through its controller."""
         frame = self.app_state.current_frame
+        self.frame_spinbox.blockSignals(True)
+        self.frame_spinbox.setValue(frame)
+        self.frame_spinbox.blockSignals(False)
+        self.timecode_edit.setText(self._frame_to_timecode(frame))
 
-        # Calculate OM frame with sync offset
+        if self._preview_controller is not None:
+            self._request_engine_preview()
+            return
+
+        # Retain the pre-existing source extraction path only when no preview
+        # controller is attached (e.g. a legacy standalone panel).
         offset = 0
         if self.app_state.sync_proposal:
             offset = self.app_state.sync_proposal.offset
