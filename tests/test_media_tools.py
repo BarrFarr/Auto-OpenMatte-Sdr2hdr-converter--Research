@@ -21,10 +21,93 @@ def _tool_filename(name: str) -> str:
     return f"{name}.exe" if os.name == "nt" else name
 
 
+def _without_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Drop the explicit tool override so the lower tiers can be tested."""
+    monkeypatch.delenv("OPENMATTE_FFMPEG", raising=False)
+    monkeypatch.delenv("OPENMATTE_FFPROBE", raising=False)
+
+
+def test_environment_override_is_the_first_resolution_tier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An explicitly configured tool path outranks bundled, development and PATH."""
+    chosen_bin = (tmp_path / "chosen").resolve()
+    chosen_bin.mkdir(parents=True)
+    ffmpeg = chosen_bin / _tool_filename("ffmpeg")
+    ffprobe = chosen_bin / _tool_filename("ffprobe")
+    ffmpeg.write_bytes(b"chosen ffmpeg")
+    ffprobe.write_bytes(b"chosen ffprobe")
+
+    app_root = (tmp_path / "installed-app").resolve()
+    bundled_bin = app_root / "bin"
+    bundled_bin.mkdir(parents=True)
+    (bundled_bin / _tool_filename("ffmpeg")).write_bytes(b"bundled ffmpeg")
+    (bundled_bin / _tool_filename("ffprobe")).write_bytes(b"bundled ffprobe")
+
+    monkeypatch.setenv("OPENMATTE_FFMPEG", str(ffmpeg))
+    monkeypatch.setenv("OPENMATTE_FFPROBE", str(ffprobe))
+
+    config = MediaToolLocator(
+        app_root=app_root,
+        repository_root=tmp_path / "repository-without-tools",
+    ).resolve()
+
+    assert config.ffmpeg_path == ffmpeg.resolve()
+    assert config.ffprobe_path == ffprobe.resolve()
+    assert config.ffmpeg_source == "environment"
+    assert config.ffprobe_source == "environment"
+
+
+def test_environment_override_accepts_a_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A directory value is resolved to the tool inside it."""
+    chosen_bin = (tmp_path / "chosen").resolve()
+    chosen_bin.mkdir(parents=True)
+    ffmpeg = chosen_bin / _tool_filename("ffmpeg")
+    ffmpeg.write_bytes(b"chosen ffmpeg")
+    monkeypatch.setenv("OPENMATTE_FFMPEG", str(chosen_bin))
+    monkeypatch.delenv("OPENMATTE_FFPROBE", raising=False)
+
+    config = MediaToolLocator(
+        app_root=(tmp_path / "installed-app").resolve(),
+        repository_root=tmp_path / "repository-without-tools",
+    ).resolve()
+
+    assert config.ffmpeg_path == ffmpeg.resolve()
+    assert config.ffmpeg_source == "environment"
+
+
+def test_environment_override_is_ignored_when_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stale override must not hide a working bundled tool."""
+    app_root = (tmp_path / "installed-app").resolve()
+    bundled_bin = app_root / "bin"
+    bundled_bin.mkdir(parents=True)
+    ffmpeg = bundled_bin / _tool_filename("ffmpeg")
+    ffmpeg.write_bytes(b"bundled ffmpeg")
+    monkeypatch.setenv("OPENMATTE_FFMPEG", str(tmp_path / "absent" / "ffmpeg.exe"))
+    monkeypatch.delenv("OPENMATTE_FFPROBE", raising=False)
+
+    config = MediaToolLocator(
+        app_root=app_root,
+        repository_root=tmp_path / "repository-without-tools",
+    ).resolve()
+
+    assert config.ffmpeg_path == ffmpeg.resolve()
+    assert config.ffmpeg_source == "bundled"
+
+
 def test_bundled_tools_have_priority_and_use_absolute_application_root(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     """The application-local bin directory wins over development and PATH."""
+    _without_env_override(monkeypatch)
     app_root = (tmp_path / "installed-app").resolve()
     bundled_bin = app_root / "bin"
     bundled_bin.mkdir(parents=True)
@@ -46,8 +129,12 @@ def test_bundled_tools_have_priority_and_use_absolute_application_root(
     assert config.complete
 
 
-def test_development_tree_is_the_second_resolution_tier(tmp_path: Path) -> None:
+def test_development_tree_is_the_second_resolution_tier(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     """The repository-relative development tree is used when no bundle exists."""
+    _without_env_override(monkeypatch)
     repository_root = (tmp_path / "repository").resolve()
     development_bin = repository_root / "dev" / "ffmpeg-build" / "install" / "bin"
     development_bin.mkdir(parents=True)

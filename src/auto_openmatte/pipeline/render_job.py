@@ -31,7 +31,9 @@ from auto_openmatte.pipeline.checkpoint import (
 )
 from auto_openmatte.pipeline.render import (
     RenderCancelled,
+    RenderSession,
     render_project_segment,
+    segment_mode_for,
 )
 from auto_openmatte.utils.ffmpeg import get_media_tool_config
 
@@ -267,6 +269,11 @@ class RenderJobRunner:
             checkpoint_path=str(self.checkpoint_path),
         )
 
+        # One decoder pair serves every segment of this job. Without it each
+        # segment would reopen both sources at frame zero and step through all
+        # earlier frames again, so a long render would spend most of its time
+        # re-decoding material it had already passed.
+        session: RenderSession | None = None
         try:
             for plan in plans:
                 index = plan["index"]
@@ -299,6 +306,15 @@ class RenderJobRunner:
                         checkpoint_path=str(self.checkpoint_path),
                     )
 
+                if session is None:
+                    # Opened on the first pending segment so a job that resumes
+                    # with everything already committed starts no decoder.
+                    session = RenderSession(
+                        self.project,
+                        self.config,
+                        forced_mode=segment_mode_for(self.project),
+                        cancel_callback=lambda: self.cancel_event.is_set(),
+                    )
                 render_project_segment(
                     self.project,
                     temp_segment,
@@ -307,6 +323,7 @@ class RenderJobRunner:
                     frame_end=plan["frame_end"],
                     progress_callback=segment_progress,
                     cancel_callback=lambda: self.cancel_event.is_set() or self.pause_event.is_set(),
+                    session=session,
                 )
                 ffprobe = get_media_tool_config().require("ffprobe")
                 checked = validate_segment(temp_segment, plan["frame_count"], ffprobe_path=ffprobe)
@@ -407,6 +424,9 @@ class RenderJobRunner:
         except Exception as exc:
             self._save(state, "FAILED", str(exc))
             raise
+        finally:
+            if session is not None:
+                session.close()
 
 
 def run_segmented_render(*args: Any, **kwargs: Any) -> bool:

@@ -99,6 +99,7 @@ class MediaToolLocator:
     """
 
     _DEVELOPMENT_RELATIVE_BIN = Path("dev") / "ffmpeg-build" / "install" / "bin"
+    _ENV_OVERRIDE = {"ffmpeg": "OPENMATTE_FFMPEG", "ffprobe": "OPENMATTE_FFPROBE"}
 
     def __init__(
         self,
@@ -130,6 +131,27 @@ class MediaToolLocator:
             return (f"{tool}.exe", tool)
         return (tool,)
 
+    def _env_path(self, tool: ToolName) -> Path | None:
+        """Return an explicitly configured tool path from the environment.
+
+        This lets a deployment select a specific FFmpeg build (for example an
+        assembly-optimized one) without changing PATH order, which matters when
+        other components load their own FFmpeg shared libraries. An unset or
+        non-existent value is ignored so resolution falls back to the normal
+        bundled/development/PATH order.
+        """
+        raw = os.environ.get(self._ENV_OVERRIDE[tool], "").strip().strip('"')
+        if not raw:
+            return None
+        candidate = Path(raw).expanduser()
+        if candidate.is_dir():
+            for name in self._tool_names(tool):
+                nested = candidate / name
+                if nested.is_file():
+                    return nested.resolve()
+            return None
+        return candidate.resolve() if candidate.is_file() else None
+
     def _bundled_path(self, tool: ToolName) -> Path | None:
         directory = self.application_root / "bin"
         for name in self._tool_names(tool):
@@ -154,6 +176,7 @@ class MediaToolLocator:
 
     def _resolve_one(self, tool: ToolName) -> tuple[Path | None, str | None]:
         for source, resolver in (
+            ("environment", self._env_path),
             ("bundled", self._bundled_path),
             ("development", self._development_path),
             ("PATH", self._path_path),

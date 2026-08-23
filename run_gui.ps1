@@ -1,5 +1,12 @@
 param(
     [string]$RuntimeRoot = 'C:\Users\xroki\om-v5-runtime',
+    # Directory holding the FFmpeg/ffprobe executables used for analysis and
+    # rendering. Pass '' to keep the previous PATH-based resolution.
+    [string]$MediaToolsBin = 'C:\ffmpeg\bin',
+    # Run the EXTEND extension-strip transform on the GPU. Falls back to the CPU
+    # automatically when CUDA is unavailable. Pass -GpuTransform:$false to force
+    # the CPU path.
+    [bool]$GpuTransform = $true,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$GuiArgs
 )
@@ -36,6 +43,29 @@ $env:PATH = @(
     $cudaBin,
     $env:PATH
 ) -join $pathSeparator
+
+# The runtime FFmpeg is built with --disable-x86asm, which decodes HEVC several
+# times slower than an assembly-optimized build. Point only the subprocess tools
+# at a faster static build; the runtime's shared FFmpeg libraries stay on PATH so
+# the native GPU bridge keeps loading exactly what it expects.
+if ($MediaToolsBin) {
+    $toolFfmpeg = Join-Path $MediaToolsBin 'ffmpeg.exe'
+    $toolFfprobe = Join-Path $MediaToolsBin 'ffprobe.exe'
+    if ((Test-Path -LiteralPath $toolFfmpeg) -and (Test-Path -LiteralPath $toolFfprobe)) {
+        $env:OPENMATTE_FFMPEG = $toolFfmpeg
+        $env:OPENMATTE_FFPROBE = $toolFfprobe
+    }
+    else {
+        Write-Warning "MediaToolsBin '$MediaToolsBin' has no ffmpeg.exe/ffprobe.exe; falling back to PATH resolution."
+    }
+}
+
+if ($GpuTransform) {
+    $env:OPENMATTE_GPU_TRANSFORM = '1'
+}
+else {
+    Remove-Item Env:OPENMATTE_GPU_TRANSFORM -ErrorAction SilentlyContinue
+}
 
 & $python -m gui @GuiArgs
 exit $LASTEXITCODE
