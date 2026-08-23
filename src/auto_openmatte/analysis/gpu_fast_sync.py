@@ -44,7 +44,9 @@ from auto_openmatte.core.exceptions import SynchronizationError
 from auto_openmatte.core.models import SourceInfo, SyncModel, SyncStatus
 from auto_openmatte.utils.ffmpeg import get_media_tool_config
 
-GPU_FAST_MAX_SECONDS = 10 * 60.0
+GPU_FAST_ANALYSIS_MINUTES = (5, 10, 20, 60)
+GPU_FAST_ALLOWED_SECONDS = tuple(minutes * 60.0 for minutes in GPU_FAST_ANALYSIS_MINUTES)
+GPU_FAST_MAX_SECONDS = max(GPU_FAST_ALLOWED_SECONDS)
 
 # Descriptor geometry. Both sources are reduced to the same working plane so
 # their descriptors describe the same framing at the same resolution.
@@ -1111,12 +1113,26 @@ def find_fast_global_offset_gpu(
     """Find a bounded GPU-only first-ten-minute synchronization proposal."""
     started = time.perf_counter()
     config = config or SyncConfig()
+    requested_analysis_seconds = float(
+        getattr(config, "analysis_range_seconds", 10 * 60.0)
+    )
+    if requested_analysis_seconds not in GPU_FAST_ALLOWED_SECONDS:
+        allowed = ", ".join(str(int(value // 60)) for value in GPU_FAST_ALLOWED_SECONDS)
+        raise SynchronizationError(
+            "GPU Fast Auto Sync analysis range must be one of "
+            f"{allowed} minutes; got {requested_analysis_seconds / 60.0:g} minutes"
+        )
     hdr_fps, om_fps = _validate_sources(hdr_source, om_source)
     hdr_fps_fraction = _fps_fraction(hdr_source)
     om_fps_fraction = _fps_fraction(om_source)
     hdr_duration = _source_duration(hdr_source)
     om_duration = _source_duration(om_source)
-    analysis_limit = min(GPU_FAST_MAX_SECONDS, hdr_duration, om_duration)
+    analysis_limit = min(
+        requested_analysis_seconds,
+        GPU_FAST_MAX_SECONDS,
+        hdr_duration,
+        om_duration,
+    )
     if analysis_limit < 30.0:
         raise SynchronizationError(
             "GPU Fast Auto Sync requires at least 30 seconds in both sources; "
@@ -1628,6 +1644,7 @@ def find_fast_global_offset_gpu(
         "schema_version": 3,
         "strategy": "gpu_native_hdr_band_scan_anchor_consensus",
         "gpu_only": True,
+        "requested_analysis_seconds": float(requested_analysis_seconds),
         "analysis_limit_seconds": float(analysis_limit),
         "elapsed_seconds": float(elapsed),
         "device_index": int(runtime.device_index),

@@ -6,13 +6,14 @@ source files, sync proposals, shot locks, render status, and the current
 project file path. All panels observe AppState via Qt signals.
 """
 from dataclasses import dataclass, field
-from typing import Optional
 from pathlib import Path
+from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
+from auto_openmatte.core.config import FAST_SYNC_ANALYSIS_MINUTES
 from auto_openmatte.core.mode import ProcessingMode
-from gui.models.sync_state import SyncProposal, ShotLock
+from gui.models.sync_state import ShotLock, SyncProposal
 
 
 @dataclass
@@ -134,6 +135,7 @@ class AppState(QObject):
     preview_frame_changed = Signal()
     processing_mode_changed = Signal()
     preview_quality_changed = Signal()
+    fast_sync_analysis_changed = Signal(int)
     status_message = Signal(str)
 
     def __init__(self, parent=None):
@@ -154,6 +156,7 @@ class AppState(QObject):
 
         # Sync
         self.sync_proposal: Optional[SyncProposal] = None
+        self.fast_sync_analysis_minutes: int = 10
         self.shot_locks: list = []  # List[ShotLock]
 
         # Preview
@@ -174,6 +177,7 @@ class AppState(QObject):
         self.hdr_source = None
         self.om_source = None
         self.sync_proposal = None
+        self.fast_sync_analysis_minutes = 10
         self.shot_locks = []
         self.processing_mode = ProcessingMode.EXTEND
         self.preview_quality = "DRAFT"
@@ -188,6 +192,7 @@ class AppState(QObject):
         self.shots_changed.emit()
         self.processing_mode_changed.emit()
         self.preview_quality_changed.emit()
+        self.fast_sync_analysis_changed.emit(self.fast_sync_analysis_minutes)
 
     def load_project(self, path: str) -> bool:
         """Load project from .omhdr file.
@@ -210,6 +215,7 @@ class AppState(QObject):
             self.sync_changed.emit()
             self.shots_changed.emit()
             self.processing_mode_changed.emit()
+            self.fast_sync_analysis_changed.emit(self.fast_sync_analysis_minutes)
             return True
         except Exception as e:
             self.status_message.emit(f"Load failed: {e}")
@@ -224,8 +230,6 @@ class AppState(QObject):
         Returns:
             True if saved successfully.
         """
-        from gui.models.project import ProjectFile
-
         save_path = path or self.project_path
         if not save_path:
             return False
@@ -293,6 +297,21 @@ class AppState(QObject):
         self.preview_quality = normalized
         self.preview_quality_changed.emit()
 
+    def set_fast_sync_analysis_minutes(self, minutes: int):
+        """Set and persist the selected GPU Fast Sync analysis duration."""
+        minutes = int(minutes)
+        if minutes not in FAST_SYNC_ANALYSIS_MINUTES:
+            raise ValueError(
+                "Fast Sync analysis duration must be one of "
+                f"{FAST_SYNC_ANALYSIS_MINUTES} minutes"
+            )
+        if minutes == self.fast_sync_analysis_minutes:
+            return
+        self.fast_sync_analysis_minutes = minutes
+        self.is_dirty = True
+        self.fast_sync_analysis_changed.emit(minutes)
+        self.project_changed.emit()
+
     def set_current_frame(self, frame: int):
         """Update current preview frame."""
         if frame < 0:
@@ -315,18 +334,31 @@ class AppState(QObject):
         self.project_version = project_file.version
         self.processing_mode = ProcessingMode.coerce(project_file.processing_mode)
 
-        if project_file.hdr_source_path:
-            self.hdr_source = SourceFileInfo(
+        self.hdr_source = (
+            SourceFileInfo(
                 path=project_file.hdr_source_path,
                 filename=Path(project_file.hdr_source_path).name,
                 is_valid=True,
             )
-        if project_file.om_source_path:
-            self.om_source = SourceFileInfo(
+            if project_file.hdr_source_path
+            else None
+        )
+        self.om_source = (
+            SourceFileInfo(
                 path=project_file.om_source_path,
                 filename=Path(project_file.om_source_path).name,
                 is_valid=True,
             )
+            if project_file.om_source_path
+            else None
+        )
+        self.sync_proposal = project_file.sync_proposal
+        loaded_minutes = int(project_file.fast_sync_analysis_minutes)
+        self.fast_sync_analysis_minutes = (
+            loaded_minutes
+            if loaded_minutes in FAST_SYNC_ANALYSIS_MINUTES
+            else 10
+        )
 
         self.shot_locks = project_file.shot_locks
         self.render_config = project_file.render_config or RenderConfig()
@@ -342,4 +374,6 @@ class AppState(QObject):
             om_source_path=self.om_source.path if self.om_source else "",
             shot_locks=list(self.shot_locks),
             render_config=self.render_config,
+            sync_proposal=self.sync_proposal,
+            fast_sync_analysis_minutes=self.fast_sync_analysis_minutes,
         )

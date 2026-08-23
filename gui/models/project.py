@@ -34,6 +34,7 @@ class ProjectFile:
     shot_locks: list = field(default_factory=list)  # List[ShotLock]
     render_config: Optional[object] = None
     sync_proposal: Optional[SyncProposal] = None
+    fast_sync_analysis_minutes: int = 10
 
     def save(self, path: str):
         """Save project to .omhdr JSON file.
@@ -56,6 +57,7 @@ class ProjectFile:
                 if self.sync_proposal
                 else None
             ),
+            "fast_sync_analysis_minutes": int(self.fast_sync_analysis_minutes),
         }
 
         file_path = Path(path)
@@ -111,6 +113,9 @@ class ProjectFile:
             shot_locks=shot_locks,
             render_config=render_config,
             sync_proposal=sync_proposal,
+            fast_sync_analysis_minutes=int(
+                data.get("fast_sync_analysis_minutes", 10)
+            ),
         )
 
     def _serialize_render_config(self) -> Optional[dict]:

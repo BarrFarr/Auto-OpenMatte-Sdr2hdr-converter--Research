@@ -8,23 +8,22 @@ Features:
 - File info display (resolution, fps, codec, duration, color space)
 - Compatibility validation between HDR and OM sources
 """
-from PySide6.QtWidgets import (
-    QWidget,
-    QVBoxLayout,
-    QHBoxLayout,
-    QGroupBox,
-    QLabel,
-    QPushButton,
-    QLineEdit,
-    QGridLayout,
-    QFileDialog,
-    QMessageBox,
-)
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
-from gui.models.state import AppState, SourceFileInfo
 from gui.controllers.pipeline_adapter import PipelineAdapter
+from gui.models.state import AppState, SourceFileInfo
 
 
 class FileDropWidget(QWidget):
@@ -317,11 +316,31 @@ class SourcePanel(QWidget):
 
     @Slot()
     def _refresh_display(self):
-        """Refresh info displays from current state."""
-        if self.app_state.hdr_source:
-            self.hdr_info.update_info(self.app_state.hdr_source)
-        if self.app_state.om_source:
-            self.om_info.update_info(self.app_state.om_source)
+        """Refresh source paths and metadata from current state."""
+        hdr = self.app_state.hdr_source
+        if hdr:
+            self.hdr_drop.set_path(hdr.path)
+            if hdr.path and hdr.width <= 0:
+                inspected = self.adapter.inspect_file(hdr.path)
+                if inspected:
+                    self.app_state.hdr_source = hdr = inspected
+            self.hdr_info.update_info(hdr)
+        else:
+            self.hdr_drop.set_path("")
+            self.hdr_info.clear()
+
+        om = self.app_state.om_source
+        if om:
+            self.om_drop.set_path(om.path)
+            if om.path and om.width <= 0:
+                inspected = self.adapter.inspect_file(om.path)
+                if inspected:
+                    self.app_state.om_source = om = inspected
+            self.om_info.update_info(om)
+        else:
+            self.om_drop.set_path("")
+            self.om_info.clear()
+
         self._validate_compatibility()
 
     def _validate_compatibility(self):

@@ -12,6 +12,7 @@ Offset is shot-level, not per-frame.
 """
 from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QComboBox,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from auto_openmatte.core.config import FAST_SYNC_ANALYSIS_MINUTES
 from gui.controllers.sync_controller import SyncController
 from gui.models.state import AppState
 from gui.models.sync_state import SyncProposal, SyncQuality
@@ -125,9 +127,19 @@ class SyncPanel(QWidget):
         auto_layout.addWidget(self.auto_sync_btn)
 
         # Optional bounded fast strategy
+        fast_controls_layout = QHBoxLayout()
         self.fast_sync_btn = QPushButton("FAST AUTO SYNC (GPU)", self)
         self.fast_sync_btn.setProperty("class", "secondary-button")
-        auto_layout.addWidget(self.fast_sync_btn)
+        fast_controls_layout.addWidget(self.fast_sync_btn, 1)
+        fast_controls_layout.addWidget(QLabel("Analyze:", self))
+        self.fast_analysis_combo = QComboBox(self)
+        for minutes in FAST_SYNC_ANALYSIS_MINUTES:
+            self.fast_analysis_combo.addItem(f"{minutes} min", minutes)
+        self.fast_analysis_combo.setCurrentIndex(
+            self.fast_analysis_combo.findData(10)
+        )
+        fast_controls_layout.addWidget(self.fast_analysis_combo)
+        auto_layout.addLayout(fast_controls_layout)
 
         fast_info_layout = QGridLayout()
         fast_info_layout.addWidget(QLabel("Fast scope:"), 0, 0)
@@ -270,8 +282,15 @@ class SyncPanel(QWidget):
         """Connect UI signals."""
         self.auto_sync_btn.clicked.connect(self._run_auto_sync)
         self.fast_sync_btn.clicked.connect(self._run_fast_auto_sync)
+        self.fast_analysis_combo.currentIndexChanged.connect(
+            self._on_fast_analysis_changed
+        )
+        self.app_state.fast_sync_analysis_changed.connect(
+            self._on_fast_analysis_state_changed
+        )
         self.sync_controller.sync_progress.connect(self._on_fast_sync_progress)
         self.sync_controller.sync_finished.connect(self._on_sync_finished)
+        self.sync_controller.sync_error.connect(self._on_fast_sync_error)
         self.minus_1_btn.clicked.connect(lambda: self._adjust_offset(-1))
         self.plus_1_btn.clicked.connect(lambda: self._adjust_offset(1))
         self.minus_10_btn.clicked.connect(lambda: self._adjust_offset(-10))
@@ -283,6 +302,28 @@ class SyncPanel(QWidget):
         # State observation
         self.app_state.sync_changed.connect(self._refresh_display)
 
+    def _update_fast_scope_label(self, minutes: int):
+        """Display the selected bounded analysis scope."""
+        self.fast_scope_label.setText(f"First {int(minutes)} min / GPU-only")
+
+    @Slot(int)
+    def _on_fast_analysis_changed(self, index: int):
+        """Persist the user-selected Fast Sync analysis duration."""
+        minutes = self.fast_analysis_combo.itemData(index)
+        if minutes is None:
+            return
+        minutes = int(minutes)
+        self._update_fast_scope_label(minutes)
+        self.app_state.set_fast_sync_analysis_minutes(minutes)
+
+    @Slot(int)
+    def _on_fast_analysis_state_changed(self, minutes: int):
+        """Reflect a project-loaded Fast Sync duration in the combo box."""
+        index = self.fast_analysis_combo.findData(int(minutes))
+        if index >= 0 and index != self.fast_analysis_combo.currentIndex():
+            self.fast_analysis_combo.setCurrentIndex(index)
+        self._update_fast_scope_label(int(minutes))
+
     @Slot()
     def _run_auto_sync(self):
         """Invoke auto-sync via the controller."""
@@ -293,13 +334,16 @@ class SyncPanel(QWidget):
 
     @Slot()
     def _run_fast_auto_sync(self):
-        """Invoke bounded Fast Auto Sync via the controller."""
+        """Invoke bounded Fast Auto Sync using the selected minute range."""
+        minutes = int(self.fast_analysis_combo.currentData())
+        self._update_fast_scope_label(minutes)
         self.fast_sync_btn.setEnabled(False)
-        self.fast_status_label.setText("Starting GPU-only path...")
+        self.fast_status_label.setText(
+            f"Starting GPU-only path ({minutes} min)..."
+        )
         self.fast_elapsed_label.setText("0.0 s")
-        if not self.sync_controller.run_fast_auto_sync():
+        if not self.sync_controller.run_fast_auto_sync(minutes):
             self.fast_sync_btn.setEnabled(True)
-            self.fast_status_label.setText("Not started")
             self.fast_elapsed_label.setText("--")
 
     @Slot(object)
@@ -317,7 +361,21 @@ class SyncPanel(QWidget):
     @Slot()
     def _on_sync_finished(self):
         """Re-enable the fast button after either sync worker finishes."""
+        was_running = not self.fast_sync_btn.isEnabled()
         self.fast_sync_btn.setEnabled(True)
+        if was_running and not self.fast_status_label.text().startswith("Error:"):
+            self.fast_status_label.setText("Finished; review proposal")
+
+    @Slot(str)
+    def _on_fast_sync_error(self, message: str):
+        """Keep Fast Auto Sync errors visible in the sync panel."""
+        if self.fast_sync_btn.isEnabled() and not self.fast_status_label.text().startswith(
+            "Starting"
+        ):
+            return
+        self.fast_sync_btn.setEnabled(True)
+        self.fast_status_label.setText(f"Error: {message}")
+        self.fast_status_label.setToolTip(message)
 
     @Slot(int)
     def _adjust_offset(self, delta: int):

@@ -247,14 +247,21 @@ class SyncWorker(QThread):
 class FastSyncWorker(QThread):
     """Worker for the optional first-ten-minute Fast Auto Sync strategy."""
 
-    finished = Signal(object)
+    completed = Signal(object)
     progress = Signal(object)
     error = Signal(str)
 
-    def __init__(self, hdr_path: str, om_path: str, parent=None):
+    def __init__(
+        self,
+        hdr_path: str,
+        om_path: str,
+        analysis_seconds: float = 600.0,
+        parent=None,
+    ):
         super().__init__(parent)
         self.hdr_path = hdr_path
         self.om_path = om_path
+        self.analysis_seconds = float(analysis_seconds)
 
     def run(self):
         """Run bounded fast sync in the background thread."""
@@ -277,7 +284,7 @@ class FastSyncWorker(QThread):
 
             hdr_source = _inspect_backend_source(self.hdr_path)
             om_source = _inspect_backend_source(self.om_path)
-            config = SyncConfig()
+            config = SyncConfig(analysis_range_seconds=self.analysis_seconds)
             sync_model = find_fast_global_offset_gpu(
                 hdr_source,
                 om_source,
@@ -302,22 +309,21 @@ class FastSyncWorker(QThread):
                     )
                 ),
                 "elapsed_seconds": elapsed_seconds,
+                "analysis_range_seconds": self.analysis_seconds,
                 "fast_confidence": getattr(sync_model, "fast_confidence", None),
                 "fast_diagnostic_status": getattr(
                     sync_model, "fast_diagnostic_status", ""
                 ),
                 "fast_diagnostics": getattr(sync_model, "fast_diagnostics", {}),
             }
-            self.finished.emit(result)
+            self.completed.emit(result)
 
         except ImportError as exc:
             logger.exception("Fast auto-sync backend import failed")
             self.error.emit(f"Fast auto-sync backend import failed: {exc}")
-            self.finished.emit(None)
 
         except Exception as exc:
             self.error.emit(str(exc))
-            self.finished.emit(None)
 
 
 class RenderWorker(QThread):
@@ -689,10 +695,20 @@ class PipelineAdapter(QObject):
         self._sync_worker.error.connect(self.error_occurred.emit)
         self._sync_worker.start()
 
-    def run_fast_auto_sync(self, hdr_path: str, om_path: str):
-        """Start the optional first-ten-minute fast auto-sync strategy."""
-        self._sync_worker = FastSyncWorker(hdr_path, om_path, self)
-        self._sync_worker.finished.connect(self.sync_completed.emit)
+    def run_fast_auto_sync(
+        self,
+        hdr_path: str,
+        om_path: str,
+        analysis_seconds: float = 600.0,
+    ):
+        """Start the bounded GPU fast auto-sync strategy."""
+        self._sync_worker = FastSyncWorker(
+            hdr_path,
+            om_path,
+            analysis_seconds=analysis_seconds,
+            parent=self,
+        )
+        self._sync_worker.completed.connect(self.sync_completed.emit)
         self._sync_worker.progress.connect(self.sync_progress.emit)
         self._sync_worker.error.connect(self.error_occurred.emit)
         self._sync_worker.start()

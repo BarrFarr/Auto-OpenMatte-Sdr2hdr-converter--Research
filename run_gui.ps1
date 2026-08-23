@@ -1,11 +1,11 @@
 param(
-    [string]$RuntimeRoot = 'G:\Auto-OpenMatte-Sdr2hdr-converter — kopia',
+    [string]$RuntimeRoot = 'C:\Users\xroki\om-v5-runtime',
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$GuiArgs
 )
 
 $ErrorActionPreference = 'Stop'
-$repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$repoRoot = $PSScriptRoot
 $python = Join-Path $RuntimeRoot '.venv\Scripts\python.exe'
 $ffmpegBin = Join-Path $RuntimeRoot 'dev\ffmpeg-build\install\bin'
 $bridgeBin = Join-Path $RuntimeRoot 'dev\v05-native'
@@ -14,8 +14,8 @@ $runtimeTools = Join-Path $RuntimeRoot 'tools\openmatte_hdr'
 $bridgePath = Join-Path $bridgeBin 'v5_gpu_bridge.dll'
 
 foreach ($required in @($python, $ffmpegBin, $bridgeBin, $runtimeTools, $bridgePath)) {
-    if (-not (Test-Path $required)) {
-        throw "Required recovered V5 runtime path is missing: $required"
+    if (-not (Test-Path -LiteralPath $required)) {
+        throw "Required V5 runtime path is missing: $required"
     }
 }
 

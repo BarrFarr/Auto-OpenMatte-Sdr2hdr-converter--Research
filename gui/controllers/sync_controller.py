@@ -13,6 +13,7 @@ It calls the backend and manages GUI state transitions.
 """
 from PySide6.QtCore import QObject, Signal, Slot
 
+from auto_openmatte.core.config import FAST_SYNC_ANALYSIS_MINUTES
 from gui.controllers.pipeline_adapter import PipelineAdapter
 from gui.models.state import AppState
 from gui.models.sync_state import (
@@ -29,6 +30,7 @@ class SyncController(QObject):
     sync_started = Signal()
     sync_finished = Signal()
     sync_progress = Signal(object)
+    sync_error = Signal(str)
     lock_confirmed = Signal(str)  # shot_id
 
     def __init__(
@@ -67,28 +69,43 @@ class SyncController(QObject):
         self.app_state.status_message.emit("Running auto-sync...")
         self.adapter.run_auto_sync(hdr.path, om.path)
 
-    def run_fast_auto_sync(self) -> bool:
+    def run_fast_auto_sync(self, analysis_minutes: int = 10) -> bool:
         """Initiate bounded Fast Auto Sync as a proposal-only strategy."""
         hdr = self.app_state.hdr_source
         om = self.app_state.om_source
 
         if not hdr or not om:
-            self.app_state.status_message.emit(
-                "Cannot fast-sync: both HDR and OM sources required"
-            )
+            message = "Cannot fast-sync: both HDR and OM sources required"
+            self.sync_error.emit(message)
+            self.app_state.status_message.emit(message)
             return False
 
         if not hdr.path or not om.path:
-            self.app_state.status_message.emit(
-                "Cannot fast-sync: source paths not set"
-            )
+            message = "Cannot fast-sync: source paths not set"
+            self.sync_error.emit(message)
+            self.app_state.status_message.emit(message)
+            return False
+
+        try:
+            analysis_minutes = int(analysis_minutes)
+        except (TypeError, ValueError):
+            analysis_minutes = 10
+        if analysis_minutes not in FAST_SYNC_ANALYSIS_MINUTES:
+            allowed = ", ".join(str(value) for value in FAST_SYNC_ANALYSIS_MINUTES)
+            message = f"Cannot fast-sync: analysis range must be {allowed} minutes"
+            self.sync_error.emit(message)
+            self.app_state.status_message.emit(message)
             return False
 
         self.sync_started.emit()
         self.app_state.status_message.emit(
-            "Running Fast Auto Sync (First 10 min)..."
+            f"Running Fast Auto Sync (First {analysis_minutes} min)..."
         )
-        self.adapter.run_fast_auto_sync(hdr.path, om.path)
+        self.adapter.run_fast_auto_sync(
+            hdr.path,
+            om.path,
+            analysis_seconds=float(analysis_minutes * 60),
+        )
         return True
 
     def adjust_offset(self, delta: int):
@@ -263,5 +280,6 @@ class SyncController(QObject):
     @Slot(str)
     def _on_error(self, message: str):
         """Handle errors from the adapter."""
+        self.sync_error.emit(message)
         self.sync_finished.emit()
         self.app_state.status_message.emit(f"Sync error: {message}")

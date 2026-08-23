@@ -4,6 +4,8 @@ from dataclasses import dataclass, field
 
 from auto_openmatte.core.mode import ProcessingMode
 
+FAST_SYNC_ANALYSIS_MINUTES = (5, 10, 20, 60)
+
 
 @dataclass
 class SyncConfig:
@@ -11,6 +13,8 @@ class SyncConfig:
 
     # Search range in seconds for global offset detection
     search_range_seconds: float = 120.0
+    # Length of the bounded Fast Auto Sync analysis window in seconds.
+    analysis_range_seconds: float = 600.0
     # Number of sample points for offset validation across the film
     validation_points: int = 20
     # Minimum confidence to accept synchronization
